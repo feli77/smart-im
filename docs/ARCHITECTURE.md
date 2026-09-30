@@ -1,63 +1,61 @@
-# 灵序 Smart IM — 架构设计
+# Smart IM 架构（Rime MVP）
 
-## 目标与边界
+## 当前主线
 
-首发 Windows，完全本地运行。MVP 提供可独立运行的桌面体验台，以及基于 Windows 键盘钩子和 Unicode SendInput 的实验性跨应用候选浮窗。后者不是已注册的 Windows TSF 输入法；完整 TSF COM Text Service、安装签名和安全输入控件识别是下一阶段工作。Linux 环境可验证核心、Qt 界面及 Windows 平台无关逻辑，不能替代真机兼容性验收。
-
-不使用云端推理，不自动下载权重。默认关闭长期学习，用户开启后只学习明确选中的候选和有限上下文统计，不记录原始键盘流水。系统浮窗只能使用自身确认输入的当前窗口会话上下文，不读取外部应用内容。桌面体验台使用编辑光标之前的文本。
-
-## 数据流
+小狼毫提供 Windows TSF、原生组合输入、候选窗口与上屏；librime 和已有 `luna_pinyin` 词典提供基础中文输入。Smart IM 只增强候选排序与个人统计，不 fork 输入法前端。
 
 ```mermaid
 flowchart LR
-    K[桌面编辑器 / Windows 浮窗] --> S[组合输入与候选选择]
-    S --> D[拼音词典 + 有界分词搜索]
-    D --> R[候选排序]
-    C[光标前有限上下文] --> R
-    M[本地语言模型] --> R
-    P[(SQLite 个性化统计)] --> R
-    R --> U[候选 / 下一短语 / 纠错建议]
-    U --> A[用户确认上屏]
-    A -->|学习开启| P
-    A --> W[原生编辑器 / SendInput]
+    K[按键] --> R[Rime 基础候选]
+    R --> UI[小狼毫原始候选]
+    R --> Q[Lua 写入最新请求]
+    Q --> F[本地文件信箱]
+    F --> S[Python 服务]
+    S --> E[Engine.rerank]
+    E --> M[本地模型上下文增益]
+    E --> P[(可选 SQLite 个人统计)]
+    S --> F
+    F --> T[Tab 校验并应用索引排列]
+    T --> UI
+    UI --> C[用户确认上屏]
+    C -->|显式开启学习| F
 ```
 
-## 模块与接口
+## 职责
 
-| 模块 | 职责 | 实现 |
-|---|---|---|
-| `types.py` | 稳定候选、建议与 LanguageModel 契约 | 不依赖 UI |
-| `decoder.py` | 全拼、简拼、分词、部分拼音、有限拼写容错 | 自带词典；pypinyin 校验新词和多音字；限制搜索宽度 |
-| `models.py` | 候选条件概率、短语续写 | 自带 NumPy 小型神经语言模型与统计基线；可选本地 GGUF |
-| `personalization.py` | 用户词频和有限上下文习惯 | SQLite；显式学习开关；可清空 |
-| `correction.py` | 常见错词和搭配修正 | 保守规则，显示原因和位置，由用户确认 |
-| `engine.py` | 合并词典、语言模型和用户证据 | 排序、去重、输入边界、降级 |
-| `session.py` | 按键到组合输入状态变更 | 可独立测试 |
-| `desktop.py` | 可视化调试与日常编辑体验 | PySide6，后台推理，拒绝过期结果 |
-| `windows.py` | Windows 实验性跨应用输入 | 热键、键盘钩子、不抢焦点浮窗、Unicode 上屏 |
-| `cli.py` | 终端测试、基准测试与数据管理 | JSON 输出便于后续 IPC 集成 |
+| 文件/模块 | 职责 |
+|---|---|
+| `rime_assets/smart_im.schema.yaml` | 独立 Rime 拼音方案；复用词典；关闭 Rime 用户词典 |
+| `rime_assets/lua/smart_im.lua` | 候选快照、后台请求、Tab 重排、确认事件；保留原候选对象 |
+| `rime_protocol.py` | 有大小限制的版本化消息与索引排列 |
+| `rime_service.py` | 本地信箱轮询、单实例锁、心跳、异常回退、事件消费与清理 |
+| `rime_install.py` | 安装两个本项目资源；冲突预检和备份；不改其他方案 |
+| `ranking.py` | 保留原始顺序的先验 + 有界模型上下文增益 + 可选个人证据 |
+| `engine.py` | 外部 `rerank` / `commit_external`，以及保留的旧演示 API |
+| `models.py` / `personalization.py` | 复用本地模型与 SQLite，不重新设计模型系统 |
+| `decoder.py` / `session.py` / `desktop.py` / `windows.py` | 原有独立演示、测试与回归基线，不进入 Rime 主输入链路 |
 
-## 技术选型和取舍
+## 本版的关键取舍
 
-- **Python 3.10+ / NumPy**：首版快速验证输入与学习闭环，真实 CPU 本地推理，不依赖 GPU。性能瓶颈可迁移 Rust/C++，平台层不绑定模型实现。
-- **PySide6**：原生桌面组件和事件循环，后台任务通过信号回到 UI 线程。UI 不是网页，没有远端服务。
-- **SQLite**：事务保存词频与上下文后缀统计。MVP 使用单用户本地库，不提供云同步。
-- **自带微型模型**：保证断网即用；小规模自编语料只能验证完整技术链路，不能声称达到商业中文输入法质量。通用中文质量需要更大且有明确许可的词典、语料和评测集。
-- **可选 llama.cpp / GGUF**：只接收已存在的本地权重；大模型续写不应阻塞按键处理。基础路径与可选模型性能分别测量，硬件不同不承诺统一延迟。
-- **Windows 浮窗先行，TSF 后续**：浮窗可验证跨应用输入和确认行为；正式系统输入法必须实现 TSF 组合区、光标位置、候选 UI 生命周期与安全输入策略。
+**显式 Tab 重排。** Rime 插件执行与前端刷新有同步生命周期约束。为避免修改小狼毫或新增 C++ 桥接，本版不主动从后台刷新候选。每次候选变化提交新的后台请求；只有 Tab 才应用匹配版本的结果，普通空格或数字保持当前显示顺序。
 
-## 延迟设计
+**文件信箱。** Lua 标准库即可访问，安装后只需一个 Python 进程。I/O 在按键路径仅处理有界小文件；推理在独立进程。它不是零延迟通道，默认服务轮询约 20 ms，磁盘和杀毒软件可能增加开销。未来需要自动刷新时再更换 IPC/前端事件机制。
 
-目标为热态拼音候选 p95 < 30 ms（参考 CPU、短上下文、词典与自带模型），短语预测 p95 < 100 ms。这是验收目标，不是未经测量的承诺。词典前缀索引、有界 beam、有界上下文和候选数量、模型缓存与后台最新请求机制限制成本。展示结果须与当前拼音、光标和上下文版本匹配。可选 GGUF 另行记录。
+**返回索引，不重造候选。** Rime 候选包含范围和来源信息。服务只返回索引排列；Lua 保留原对象，并且只允许同一范围的有限候选参与排序。异常、过期、不合法排列均保留原序。
 
-## Personal Language Model 演进
+**本版统一由 SQLite 学习。** 专用 schema 设置 `translator/enable_user_dict: false`；AI 服务与方案开关必须同时开启才使用或保存个人统计。未来需要 Rime 自带词频学习时，应重新划分统计职责，不能直接重复叠加。
 
-`LanguageModel.score(context, text)` 与 `predict(context, limit)` 将模型与输入法解耦；个人词频目前是可解释的额外排序特征。后续可实现混合适配器，将基础 LM、个人缓存 LM、小型 adapter 融合。先积累显式接受/拒绝信号，再开展离线训练和版本评估；禁止把所有按键直接当作训练标签。隐私模式须同时停用个人统计的读和写。
+**上下文只是有限会话历史。** 不承诺获得 Word、浏览器等应用正文，也不把 Rime 会话当作可靠的编辑控件边界。导航/模式切换等可观察事件会失效上下文，但同一应用内鼠标移动等仍可能无法检测。此局限与 Windows 人工验收一起公开。
 
-## 官方技术参考
+## 扩展边界
 
-- [Qt 线程与对象](https://doc.qt.io/qtforpython-6/overviews/qtdoc-threads-qobject.html)
-- [Windows Text Services Framework](https://learn.microsoft.com/en-us/windows/win32/tsf/text-services-framework)
-- [LowLevelKeyboardProc](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc)
-- [SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)
-- [llama-cpp-python API](https://llama-cpp-python.readthedocs.io/en/latest/api-reference/)
+`Engine.rerank(texts, context, pinyin, private)` 接受外部候选并返回零基排列；`commit_external` 只在确认后记录。`LanguageModel` 接口仍可替换本地模型或 Personal LM。独立程序的 `suggest/predict/correct` 保留，但本版 Rime 不接入生成式续写或全文纠错。
+
+当前不添加服务注册/自动启动、插件管理框架、远程 API、模型下载器或训练平台。
+
+## 官方参考
+
+- [librime 架构与源码](https://github.com/rime/librime)
+- [小狼毫 Windows 前端](https://github.com/rime/weasel)
+- [librime-lua 脚本接口](https://github.com/hchunhui/librime-lua/wiki/Scripting)
+- [librime-lua 对象接口](https://github.com/hchunhui/librime-lua/wiki/Objects)

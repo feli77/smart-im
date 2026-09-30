@@ -9,6 +9,7 @@ import statistics
 import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 
 
 def parser() -> argparse.ArgumentParser:
@@ -29,7 +30,21 @@ def parser() -> argparse.ArgumentParser:
         if name != "correct":
             cmd.add_argument("--private", action="store_true", help="本次不读取或保存个人统计")
     commands.add_parser("desktop", help="打开原生桌面体验台")
-    commands.add_parser("windows", help="启动 Windows 实验性跨应用浮窗")
+    commands.add_parser("windows", help="旧版钩子浮窗演示；日常使用推荐 Rime + serve")
+    rerank = commands.add_parser("rerank", help="仅重排外部候选（Rime 路线的核心接口）")
+    rerank.add_argument("texts", nargs="+")
+    rerank.add_argument("--context", default="")
+    rerank.add_argument("--pinyin", default="")
+    rerank.add_argument("--private", action="store_true")
+    install = commands.add_parser("install-rime", help="安装独立 Rime 方案与 Lua 适配")
+    install.add_argument(
+        "--user-dir", type=Path, help="Rime 用户目录；Windows 默认为 %%APPDATA%%/Rime"
+    )
+    install.add_argument("--force", action="store_true", help="备份已有不同内容后更新本项目文件")
+    serve = commands.add_parser("serve", help="运行 Rime 的本地 AI 后台服务")
+    location = serve.add_mutually_exclusive_group()
+    location.add_argument("--user-dir", type=Path, help="Rime 用户目录")
+    location.add_argument("--runtime-dir", type=Path, help="直接指定信箱目录，用于测试或自定义部署")
     commands.add_parser("stats", help="查看本地统计")
     reset = commands.add_parser("reset", help="清空本地学习统计")
     reset.add_argument("--yes", action="store_true", help="确认清空")
@@ -52,6 +67,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "benchmark" and not 1 <= args.iterations <= 10000:
         app.error("iterations 必须介于 1 和 10000。")
     try:
+        if args.command == "install-rime":
+            from .rime_install import install_rime
+
+            emit(install_rime(args.user_dir, force=args.force))
+            return 0
         model = None
         if args.model:
             from .models import GGUFModel
@@ -66,7 +86,23 @@ def main(argv: list[str] | None = None) -> int:
         from .engine import Engine
 
         with Engine(args.data_dir, model=model, learning=args.learn) as engine:
-            if args.command == "suggest":
+            if args.command == "serve":
+                from .rime_install import runtime_dir
+                from .rime_service import MailboxService
+
+                location = args.runtime_dir or runtime_dir(args.user_dir)
+                service = MailboxService(location, engine)
+                print(f"Smart IM 服务已启动：{location}；Ctrl+C 退出。", file=sys.stderr)
+                try:
+                    service.run()
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    service.close()
+            elif args.command == "rerank":
+                order = engine.rerank(args.texts, args.context, args.pinyin, args.private)
+                emit({"order": order, "candidates": [args.texts[index] for index in order]})
+            elif args.command == "suggest":
                 emit(asdict(engine.suggest(args.text, args.context, args.limit, args.private)))
             elif args.command == "predict":
                 emit([asdict(c) for c in engine.predict(args.text, args.limit, args.private)])

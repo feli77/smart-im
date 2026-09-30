@@ -1,5 +1,7 @@
 # Windows 启动与验收
 
+> 本文保留的是 v0.1 钩子浮窗演示。v0.2 日常输入主线已改为 [Rime / 小狼毫](RIME.md)，不再继续扩展此浮窗。
+
 安装 Python 3.10+，在项目根目录打开 PowerShell：
 
 ```powershell

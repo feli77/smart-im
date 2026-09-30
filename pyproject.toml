@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "smart-im"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first Chinese predictive desktop input method"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ dependencies = ["numpy>=1.26,<3", "pypinyin>=0.53,<1"]
 [project.optional-dependencies]
 desktop = ["PySide6>=6.8,<7"]
 gguf = ["llama-cpp-python>=0.3,<0.4"]
-dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1", "lupa>=2.4,<3"]
 
 [project.scripts]
 smart-im = "smart_im.cli:main"

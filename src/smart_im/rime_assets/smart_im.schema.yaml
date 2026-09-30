@@ -1,0 +1,84 @@
+# Independent scheme: never patches the user's other Rime schemes.
+schema:
+  schema_id: smart_im
+  name: Smart IM · 灵序拼音
+  version: "0.2.0"
+  description: |
+    本地 AI 候选排序。先显示原候选，按 Tab 应用已完成的排序。
+    需要 luna_pinyin 词典、librime-lua 和独立运行的 Smart IM 服务。
+  dependencies:
+    - luna_pinyin
+
+switches:
+  - name: ascii_mode
+    reset: 0
+    states: [中文, 西文]
+  - name: smart_im_ai
+    reset: 1
+    states: [AI关闭, AI排序]
+  - name: smart_im_learning
+    reset: 0
+    states: [学习关闭, 学习开启]
+  - name: simplification
+    reset: 1
+    states: [漢字, 汉字]
+
+engine:
+  processors:
+    - lua_processor@*smart_im*processor
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - script_translator
+  filters:
+    - simplifier
+    - uniquifier
+    - lua_filter@*smart_im*filter
+
+speller:
+  alphabet: zyxwvutsrqponmlkjihgfedcba
+  delimiter: " '"
+  algebra:
+    - derive/([aeiou])ng$/$1gn/
+    - derive/([dtngkh])ong$/$1on/
+    - abbrev/^([a-z]).+$/$1/
+    - abbrev/^([zcs]h).+$/$1/
+
+translator:
+  dictionary: luna_pinyin
+  prism: smart_im
+  enable_user_dict: false
+  preedit_format:
+    - xform/([nl])v/$1ü/
+    - xform/([nl])ue/$1üe/
+    - xform/([jqxy])v/$1u/
+
+simplifier:
+  option_name: simplification
+  opencc_config: t2s.json
+  tips: none
+
+punctuator:
+  import_preset: default
+
+key_binder:
+  import_preset: default
+
+recognizer:
+  import_preset: default
+
+menu:
+  page_size: 9

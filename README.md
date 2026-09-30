@@ -1,99 +1,77 @@
 # 灵序 Smart IM
 
-本地优先的 AI 中文输入法 MVP，Windows 为首发目标。包含跨平台原生桌面体验台、可复现的小型神经语言模型，以及 Windows 实验性跨应用候选浮窗。依赖安装完成后，运行不需要网络、云端大模型或 API key。
+**Rime / 小狼毫 + 本地 AI 候选重排**。Rime 负责拼音、基础候选和上屏，Python 服务复用自带的小模型和 SQLite 个人统计。依赖安装后离线运行，不使用云端大模型。
 
-![桌面体验台](docs/desktop-preview.png)
+这一版是最小可用接入：正常输入先显示 Rime 原始候选，后台算好后按 **Tab** 应用 AI 排序，再用空格或数字选词。服务关闭、结果过期或计算失败时保持原候选。没有自动刷新候选或突然改序。
 
-## 开始使用
+## Windows 使用
 
-Windows PowerShell，在项目目录执行：
+先安装支持 `librime-lua` 的[小狼毫](https://github.com/rime/weasel)，并确保已有 `luna_pinyin` 词典/方案。项目不捆绑或修改小狼毫。
 
 ```powershell
 py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[desktop]"
-.\.venv\Scripts\python.exe -m smart_im desktop
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m smart_im install-rime
 ```
 
-跨应用实验模式：先将系统键盘切换为英文，再运行：
+在小狼毫“输入法设定”中勾选 **Smart IM**，然后重新部署并切换到该方案。安装命令只写本项目的 schema 和 Lua 文件，不改现有 `default.custom.yaml` 或 `rime.lua`。
 
 ```powershell
-.\.venv\Scripts\python.exe -m smart_im windows
+.\.venv\Scripts\python.exe -m smart_im serve
 ```
 
-Ctrl+Space 开关中文，空格选首项，1–9 选词，Tab 接受续写，Enter 提交原拼音，Esc 取消。托盘右键退出。也可使用 [PowerShell 启动脚本](scripts/start.ps1)。完整步骤和已知兼容性边界见 [Windows 说明](docs/WINDOWS.md)。
+保持终端运行。先输入并确认“我们计划”，再输入 `shishi`，稍等片刻按 Tab，可观察“实施”的排序。没有前文时保留基础顺序是正常行为。结果未就绪时提示稍后再按 Tab，不阻塞打字。Ctrl+C 关闭服务后仍可正常使用基础输入。
 
-Linux/macOS 可运行桌面体验台与核心 CLI：
+完整步骤、依赖、学习开关和人工验收见 [Rime 使用说明](docs/RIME.md)。
+
+## 架构与范围
+
+```mermaid
+flowchart LR
+    A[Windows 应用] <--> W[小狼毫 / TSF]
+    W <--> R[Rime 拼音与候选]
+    R <--> L[Smart IM Lua 适配]
+    L <-->|异步本地文件信箱| S[Python AI 服务]
+    S --> M[本地小模型]
+    S <--> P[(SQLite 个人统计)]
+```
+
+- 只重排最多 9 个范围一致的原始候选，保留 Rime Candidate 对象及其元数据，不用模型替代拼音解码。
+- 使用 Lua/Python 标准库文件信箱，无额外 Lua 网络依赖，无 HTTP 服务，也不在按键路径启动 Python 进程或等待模型。
+- 学习默认关闭：服务 `--learn` 和方案“学习开启”都开启时才使用与写入个人统计。专用方案关闭 Rime 用户词典，避免两套学习重复计数。
+- 上下文只来自当前 Rime 会话中本工具观察到的有限确认文本，不读取外部应用正文。会话不等于应用控件，焦点隔离还有限制。
+- 自带 27,484 参数字符 MLP + n-gram 是有限语料基线；Rime 改善输入底座，不会自动提升模型语言能力。
+
+本版不包含无拼音续写、文内灰字、外部文档语义改写、自动异步刷新、C++ 插件或 Personal LM 训练。已有预测与纠错继续保留在桌面体验台/CLI。当前开发环境为 Linux，Windows 小狼毫真机验收仍需执行。
+
+## CLI 与演示工具
 
 ```sh
-uv sync --extra desktop --extra dev
-uv run smart-im desktop
-uv run smart-im suggest nihao
-uv run smart-im suggest shishi --context 我们计划
-uv run smart-im predict 我们
-uv run smart-im correct 我以经完成需求分析
+# 验证外部候选排序；输出原候选的零基索引排列
+smart-im rerank 实时 事实 实施 --pinyin shishi --context 我们计划
+# 自定义 Rime 目录（Linux 需显式指定所用前端的用户目录）
+smart-im install-rime --user-dir /path/to/rime
+smart-im serve --user-dir /path/to/rime
+# 旧版独立桌面体验台，需要额外安装桌面依赖
+python -m pip install -e ".[desktop]"
+smart-im desktop
 ```
 
-不使用 uv 时，可用 `python3 -m venv .venv`，激活后 `python -m pip install -e ".[desktop,dev]"`。
+`suggest`、`predict`、`correct` 和旧的 `windows` 钩子浮窗仍可用于演示与回归测试，日常 Windows 输入主线是 Rime。桌面预览见 [截图](docs/desktop-preview.png)，旧浮窗说明见 [历史 Windows MVP](docs/WINDOWS.md)。
 
-## 已实现
+## 文档与验证
 
-| 能力 | MVP 实现 |
-|---|---|
-| 中文拼音 | 2,275 条读音记录、1,306 个多字词组；全拼、简拼、组句、部分补全、音节分隔、ü/v/u: |
-| AI 候选排序 | 词典与分词证据 + 本地模型条件概率 + 用户词频；完整词优先于未完成短语 |
-| 下一词/短语 | 上下文后缀检索、本地模型排序、个人短语转移统计；Tab 确认 |
-| 本地小模型 | 27,484 参数 NumPy 字符 MLP + n-gram；约 103 KiB 权重，自带训练脚本与自编语料 |
-| 个人学习 | SQLite 词频和最多 8 字上下文后缀；默认关闭，可清空，重启保留 |
-| 基础纠错 | 单步拼音容错与 14 条保守错词/搭配规则；语义纠错仅提供确认建议 |
-| 桌面交互 | PySide6、后台推理、版本匹配、快速空格延迟确认、光标处插入与选择替换 |
-| Windows 浮窗 | Ctrl+Space、低级键盘钩子、不抢焦点候选窗口、Unicode SendInput、托盘管理 |
-| 扩展 | 独立 LanguageModel 协议、可选本地 GGUF 适配、统一 JSON CLI |
-
-Windows 浮窗不是已注册的 TSF 输入法。当前开发环境为 Linux，Windows 接口只进行了平台无关逻辑/ABI 测试，仍需真机验收；未提供正式安装器。自带小模型用于验证输入闭环，有限词典和语料不能代表商用输入法的中文覆盖和语言质量。GGUF 接口未用真实外部权重做硬件验证。
-
-## 本地学习
-
-桌面左侧或 Windows 托盘开启“学习我的表达”；CLI 使用 `--learn`。学习关闭或单次 `--private` 时，候选与预测不读取、不写入个人统计。词频学习发生在用户确认上屏后，不记录原始按键流水。
+- [本次最小重构计划](docs/REFACTOR_PLAN.md)
+- [当前架构](docs/ARCHITECTURE.md)
+- [模型说明与可选 GGUF](docs/MODEL_CARD.md)
+- [验证记录](docs/VALIDATION.md)
 
 ```sh
-smart-im --learn commit 实施 --pinyin shishi --context 我们计划
-smart-im --learn suggest shishi --context 我们计划
-smart-im --learn suggest shishi --private
-smart-im stats
-smart-im reset --yes
-```
-
-默认库：Windows `%LOCALAPPDATA%\SmartIM\learning.sqlite3`；Linux `$XDG_DATA_HOME/smart-im/learning.sqlite3`，未设置时使用 `~/.local/share`。可用全局参数 `--data-dir` 指定目录。数据为本地明文 SQLite；当前不是加密个人模型。CLI `stats` 可在学习关闭时显式查看已有记录数量。
-
-## 架构与后续
-
-```text
-桌面编辑器 / Windows 浮窗
-          ↓
-组合输入状态机 → 拼音解码 → 引擎排序 → 候选 / 续写 / 纠错
-                              ↑
-                   LanguageModel + SQLite 个性化
-                              ↑
-                         用户确认反馈
-```
-
-- [整体架构与技术选型](docs/ARCHITECTURE.md)
-- [分阶段实现与人工验收计划](docs/PLAN.md)
-- [模型结构、训练和 GGUF 接入](docs/MODEL_CARD.md)
-- [验证记录与延迟测量](docs/VALIDATION.md)
-
-下一阶段：Windows TSF 原生服务、独立推理进程和超时取消、更大授权词库及独立质量评测集、Personal Language Model 适配训练。当前个人学习是统计适配，不是在线微调神经网络。
-
-## 开发与验证
-
-```sh
-uv sync --extra desktop --extra dev
+uv sync --extra dev --extra desktop
 uv run pytest -q
 uv run ruff check .
-uv run smart-im benchmark --iterations 1000
-uv run python scripts/benchmark.py --output docs/benchmark.json
-uv run python scripts/train_tiny_lm.py
+uv run ruff format --check .
 uv build
 ```
 
-Qt 测试自动使用 offscreen，不需要显示器。仓库提供 Ubuntu/Windows CI 配置，但尚未在远端执行。所有模型资源包含在 wheel 内，安装后可离线推理。
+测试包含真实 Lua 运行时与 Python 服务的协议整合，Qt 使用 offscreen。它们不等价于 Windows TSF 真机验收。本项目的 schema、Lua 适配、自带演示词典及模型资源都包含在 wheel 内；第三方 `luna_pinyin` 需另行安装。运行 Rime 服务不需要安装 PySide6。
