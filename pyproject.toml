@@ -11,7 +11,12 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=1.26,<3"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "ruff>=0.11,<1", "lupa>=2.4,<3"]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.11,<1",
+    "lupa>=2.4,<3",
+    "git-cliff>=2.13,<3",
+]
 
 [project.scripts]
 smart-im = "smart_im.cli:main"

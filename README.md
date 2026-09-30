@@ -82,6 +82,8 @@ uv run ruff format --check .
 uv build
 ```
 
+开发依赖包含 git-cliff，版本由 `uv.lock` 固定。使用 `uv run git-cliff --config cliff.toml --output CHANGELOG.md` 从提交历史更新变更记录；没有版本标签的修改归入 `Unreleased`。协作、提交与发布流程见 [AGENTS.md](AGENTS.md)。
+
 测试包含真实 Lua 运行时、文件信箱、Python 服务及模拟 Ollama HTTP 接口，Rime 对象由测试模拟。用户已反馈真实小狼毫界面和输入正常；本次修复与 Qwen 排序仍需重新实机验收。
 
 项目的 schema、Lua、语料及模型权重包含在 wheel 中；第三方 `luna_pinyin` 词典需另行安装。
