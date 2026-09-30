@@ -175,3 +175,39 @@ def test_external_key_supports_tones_separators_and_abbreviations():
     assert external_pinyin_key("Xī’ān") == "xian"
     assert external_pinyin_key("Lǜ4 SHI") == "lvshi"
     assert external_pinyin_key("ss") == "ss"
+
+
+def test_batch_reranker_receives_one_bounded_pool_and_personal_learning_still_works(tmp_path):
+    calls = []
+
+    class BatchModel:
+        name = "batch-test"
+
+        def rerank(self, context, texts, pinyin=""):
+            calls.append((context, list(texts), pinyin))
+            texts.clear()  # A backend cannot mutate the caller's candidate list.
+            return [2, 0, 1]
+
+    texts = ["事实", "实时", "实施"]
+    with Engine(tmp_path, BatchModel(), learning=True) as engine:
+        assert engine.rerank(texts, "前" * 200, "shishi") == [2, 0, 1]
+        assert calls == [("前" * 128, texts, "shishi")]
+        assert engine.rerank(texts, pinyin="shishi") == [0, 1, 2]
+        assert len(calls) == 1
+        engine.commit_external("shishi", "实时")
+        assert engine.rerank(texts, "前", "shishi")[0] == 1
+        assert engine.rerank(texts, "前", "shishi", private=True) == [2, 0, 1]
+
+
+@pytest.mark.parametrize("order", [[0, 0, 2], [True, 0, 2], [2, 0], [3, 0, 1], [0.0, 1, 2]])
+def test_invalid_batch_order_restores_original_including_personal_boosts(tmp_path, order):
+    class BatchModel:
+        name = "broken-batch"
+
+        def rerank(self, context, texts, pinyin=""):
+            return order
+
+    with Engine(tmp_path, BatchModel(), learning=True) as engine:
+        engine.commit_external("shishi", "实施")
+        assert engine.rerank(["事实", "实时", "实施"], "执行", "shishi") == [0, 1, 2]
+        assert engine.model_error == "ValueError"

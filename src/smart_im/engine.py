@@ -10,7 +10,7 @@ from pathlib import Path
 from .models import LocalLanguageModel
 from .personalization import PersonalStore
 from .ranking import external_pinyin_key, rank_external
-from .types import LanguageModel
+from .types import CandidateReranker, LanguageModel
 
 
 def default_data_dir() -> Path:
@@ -29,7 +29,7 @@ class Engine:
     def __init__(
         self,
         data_dir: Path | str | None = None,
-        model: LanguageModel | None = None,
+        model: LanguageModel | CandidateReranker | None = None,
         learning: bool = False,
     ) -> None:
         self.data_dir = Path(data_dir) if data_dir is not None else default_data_dir()
@@ -85,7 +85,9 @@ class Engine:
                 if context.strip():
                     context_counts = store.context_counts(context)
             try:
-                result = rank_external(texts, context, self.model, word_counts, context_counts)
+                result = rank_external(
+                    texts, context, self.model, word_counts, context_counts, pinyin
+                )
             except Exception as exc:
                 self._model_error = type(exc).__name__
                 return original

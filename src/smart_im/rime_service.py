@@ -1,4 +1,4 @@
-"""Offline mailbox worker; no sockets, input hooks, or per-key subprocesses."""
+"""Local mailbox worker; no input hooks or per-key subprocesses."""
 
 from __future__ import annotations
 
@@ -51,6 +51,9 @@ class MailboxService:
         self.poll_interval = poll_interval
         self._closed = False
         self._heartbeat_at = float("-inf")
+        self._heartbeat_lock = threading.Lock()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
         self._processed: OrderedDict[str, bytes] = OrderedDict()
         self._committed: OrderedDict[tuple[str, int], None] = OrderedDict()
         self._lock_file = (self.runtime_dir / "service.lock").open("a+b")
@@ -114,7 +117,7 @@ class MailboxService:
                 self._unlink(temporary)
 
     def _files(self, now: float) -> tuple[list[Path], list[Path]]:
-        requests: list[Path] = []
+        requests: list[tuple[int, Path]] = []
         commits: list[tuple[int, int, Path]] = []
         for path in self.runtime_dir.iterdir():
             request = _REQUEST.fullmatch(path.name)
@@ -134,23 +137,32 @@ class MailboxService:
                 self._processed.pop(path.name, None)
                 continue
             if request:
-                requests.append(path)
+                requests.append((stat.st_mtime_ns, path))
             elif commit:
                 commits.append((stat.st_mtime_ns, int(commit.group(2)), path))
         commits.sort(key=lambda item: (item[0], item[1], item[2].name))
-        return requests, [item[2] for item in commits]
+        requests.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+        return [item[1] for item in requests], [item[2] for item in commits]
 
-    def _rank(self, path: Path) -> None:
+    def _rank(self, path: Path) -> bool:
+        """Return whether inference was attempted; skip idle or expired sessions."""
+        try:
+            if time.time() - path.stat().st_mtime > STALE_SECONDS:
+                self._unlink(path)
+                self._processed.pop(path.name, None)
+                return False
+        except OSError:
+            return False
         data = self._read(path)
         if data is None or self._processed.get(path.name) == data:
-            return
+            return False
         try:
             request = parse_rank_request(data)
             if path.name != f"{request.session}.request":
                 raise ValueError("session does not match filename")
         except ValueError:
             self._remember(self._processed, path.name, data, MAX_SESSIONS)
-            return
+            return False
         fallback = False
         try:
             order = self.engine.rerank(
@@ -168,10 +180,11 @@ class MailboxService:
             fallback = True
         # A newer composition may arrive while inference is running.
         if self._read(path) != data:
-            return
+            return True
         response = self.runtime_dir / f"{request.session}.response"
         if self._atomic_write(response, render_response(request, order, fallback=fallback)):
             self._remember(self._processed, path.name, data, MAX_SESSIONS)
+        return True
 
     def _commit(self, path: Path) -> bool:
         data = self._read(path)
@@ -202,9 +215,7 @@ class MailboxService:
         if self._closed:
             raise RuntimeError("service is closed")
         now = time.time()
-        if now - self._heartbeat_at >= 1:
-            if self._atomic_write(self.runtime_dir / "heartbeat", f"{int(now)}\n".encode()):
-                self._heartbeat_at = now
+        self._heartbeat()
         try:
             requests, commits = self._files(now)
         except OSError:
@@ -214,18 +225,49 @@ class MailboxService:
             if not self._commit(path):
                 break
         for path in requests:
-            self._rank(path)
+            # Re-scan after every slow inference. A newly active application
+            # should not queue behind a whole directory of idle sessions.
+            if self._rank(path):
+                break
+
+    def _heartbeat(self) -> None:
+        # Inference can take several seconds. Liveness must not depend on it.
+        with self._heartbeat_lock:
+            now = time.time()
+            if not self._closed and now - self._heartbeat_at >= 1:
+                if self._atomic_write(self.runtime_dir / "heartbeat", f"{int(now)}\n".encode()):
+                    self._heartbeat_at = now
+
+    def _keep_alive(self) -> None:
+        while not self._heartbeat_stop.is_set():
+            self._heartbeat()
+            self._heartbeat_stop.wait(0.5)
+
+    def _stop_heartbeat(self) -> None:
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join()
+            self._heartbeat_thread = None
 
     def run(self, stop_event: threading.Event | None = None) -> None:
+        if self._closed:
+            raise RuntimeError("service is closed")
         stop = stop_event if stop_event is not None else threading.Event()
-        while not stop.is_set():
-            self.poll_once()
-            stop.wait(self.poll_interval)
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(target=self._keep_alive, daemon=True)
+        self._heartbeat_thread.start()
+        try:
+            while not stop.is_set():
+                self.poll_once()
+                stop.wait(self.poll_interval)
+        finally:
+            self._stop_heartbeat()
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._stop_heartbeat()
         try:
             self._unlink(self.runtime_dir / "heartbeat")
             # Drop all queued optional learning on normal exit: a subsequent

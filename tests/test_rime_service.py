@@ -358,3 +358,61 @@ def test_heartbeat_not_rewritten_on_every_poll(tmp_path, monkeypatch):
         monkeypatch.setattr(time, "time", lambda: 1001.3)
         service.poll_once()
         assert heartbeat.read_text() == "1001\n"
+
+
+def test_slow_model_does_not_block_heartbeat_and_shutdown_stops_thread(tmp_path, monkeypatch):
+    entered, release, pulse, stop = (threading.Event() for _ in range(4))
+    engine = FakeEngine()
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    path = tmp_path / "test-session.request"
+    path.write_bytes(message())
+    os.utime(path, (1000, 1000))
+
+    def slow_rank(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return [2, 0, 1]
+
+    engine.rerank = slow_rank
+    with MailboxService(tmp_path, engine) as service:
+        write = service._atomic_write
+
+        def observe(destination, data):
+            success = write(destination, data)
+            if destination.name == "heartbeat" and data == b"1004\n" and success:
+                pulse.set()
+            return success
+
+        monkeypatch.setattr(service, "_atomic_write", observe)
+        worker = threading.Thread(target=service.run, args=(stop,))
+        worker.start()
+        try:
+            assert entered.wait(3)
+            clock[0] = 1004.0  # Beyond Lua's 3-second liveness window.
+            assert pulse.wait(3)
+            assert not release.is_set()
+        finally:
+            stop.set()
+            release.set()
+            worker.join(5)
+        assert not worker.is_alive()
+        assert service._heartbeat_thread is None
+    assert not (tmp_path / "heartbeat").exists()
+
+
+def test_latest_active_session_gets_priority_and_requests_are_rescanned(tmp_path):
+    engine = FakeEngine()
+    with MailboxService(tmp_path, engine) as service:
+        stamp = time.time()
+        for session, age in [("older", 2), ("active", 1)]:
+            path = tmp_path / f"{session}.request"
+            path.write_bytes(message(session=session, pinyin=session))
+            os.utime(path, (stamp - age, stamp - age))
+        service.poll_once()
+        assert [call[1]["pinyin"] for call in engine.ranks] == ["active"]
+        (tmp_path / "newest.request").write_bytes(message(session="newest", pinyin="newest"))
+        service.poll_once()
+        assert [call[1]["pinyin"] for call in engine.ranks] == ["active", "newest"]
+        service.poll_once()
+        assert [call[1]["pinyin"] for call in engine.ranks] == ["active", "newest", "older"]

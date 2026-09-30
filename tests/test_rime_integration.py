@@ -59,6 +59,30 @@ def test_bundled_model_round_trip_only_changes_display_after_tab(tmp_path, bridg
         assert not (engine.data_dir / "learning.sqlite3").exists()
 
 
+def test_mixed_whole_word_and_partial_candidates_complete_round_trip(tmp_path, bridge):
+    engine = Engine(tmp_path / "personal")
+    with MailboxService(bridge.directory, engine) as service:
+        service.poll_once()
+        composition_after(bridge, "系统支持")
+        originals = bridge.make_candidates(["事实", "实", "实时", "实施", "事"])
+        originals[2]._end = 3
+        originals[5]._end = 3
+        bridge.filter(originals)
+        bridge.enable_refresh()
+        request = parse_rank_request(bridge.request_path.read_bytes())
+        assert request.candidates == ("事实", "实时", "实施")
+        bridge.press()
+        assert "计算中" in bridge.context.segment.prompt
+        service.poll_once()
+        bridge.press()
+        output = bridge.filter()
+        assert "AI排序" in bridge.context.segment.prompt
+        assert identities(output) == [3, 2, 1, 4, 5]
+        for candidate, index in zip(output, [3, 2, 1, 4, 5], strict=True):
+            assert bridge.lua.eval("rawequal")(candidate, originals[index])
+        assert output[1]._end == output[4]._end == 3
+
+
 @pytest.mark.parametrize("service_learns", [False, True])
 @pytest.mark.parametrize("client_learns", [False, True])
 def test_commit_learning_requires_both_opt_ins_end_to_end(

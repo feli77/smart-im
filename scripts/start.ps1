@@ -1,7 +1,12 @@
 param(
     [ValidateSet("serve", "install-rime")]
     [string]$Mode = "serve",
-    [switch]$Learn
+    [switch]$Learn,
+    [ValidateSet("tiny", "ollama")]
+    [string]$Backend = "tiny",
+    [string]$Model = "qwen3:0.6b",
+    [ValidateRange(0.1, 20)]
+    [double]$ModelTimeout = 10
 )
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -19,5 +24,8 @@ if ($LASTEXITCODE -ne 0) {
 $launchArgs = @("-m", "smart_im")
 if ($Learn) { $launchArgs += "--learn" }
 $launchArgs += $Mode
+if ($Mode -eq "serve") {
+    $launchArgs += @("--backend", $Backend, "--model", $Model, "--model-timeout", $ModelTimeout.ToString([Globalization.CultureInfo]::InvariantCulture))
+}
 & $projectPython @launchArgs
 exit $LASTEXITCODE

@@ -27,6 +27,20 @@ def parser() -> argparse.ArgumentParser:
     location = serve.add_mutually_exclusive_group()
     location.add_argument("--user-dir", type=Path, help="Rime 用户目录")
     location.add_argument("--runtime-dir", type=Path, help="直接指定信箱目录，用于测试或自定义部署")
+    for command in (serve, rerank):
+        command.add_argument(
+            "--backend",
+            choices=("tiny", "ollama"),
+            default="tiny",
+            help="tiny 为自带演示模型；ollama 使用本机开源模型",
+        )
+        command.add_argument("--model", default="qwen3:0.6b", help="Ollama 模型名称")
+        command.add_argument(
+            "--ollama-url", default="http://127.0.0.1:11434", help="本机 Ollama 地址"
+        )
+        command.add_argument(
+            "--model-timeout", type=float, default=10.0, help="模型请求超时秒数（0.1–20，默认10）"
+        )
     commands.add_parser("stats", help="查看本地统计")
     reset = commands.add_parser("reset", help="清空本地学习统计")
     reset.add_argument("--yes", action="store_true", help="确认清空")
@@ -50,14 +64,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         from .engine import Engine
 
-        with Engine(args.data_dir, learning=args.learn) as engine:
+        model = None
+        if getattr(args, "backend", "tiny") == "ollama":
+            from .ollama_model import OllamaReranker
+
+            model = OllamaReranker(args.model, args.ollama_url, args.model_timeout)
+        with Engine(args.data_dir, model=model, learning=args.learn) as engine:
             if args.command == "serve":
                 from .rime_install import runtime_dir
                 from .rime_service import MailboxService
 
                 location = args.runtime_dir or runtime_dir(args.user_dir)
                 service = MailboxService(location, engine)
-                print(f"Smart IM 服务已启动：{location}；Ctrl+C 退出。", file=sys.stderr)
+                print(
+                    f"Smart IM 服务已启动：{location}；模型：{engine.model.name}；Ctrl+C 退出。",
+                    file=sys.stderr,
+                )
                 try:
                     service.run()
                 except KeyboardInterrupt:
@@ -67,6 +89,13 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "rerank":
                 order = engine.rerank(args.texts, args.context, args.pinyin, args.private)
                 emit({"order": order, "candidates": [args.texts[index] for index in order]})
+                if engine.model_error:
+                    print(
+                        f"Smart IM 模型不可用（{engine.model_error}），已保留原候选。"
+                        "请检查本机 Ollama 服务、模型是否已下载，或调整 --model-timeout。",
+                        file=sys.stderr,
+                    )
+                    return 1
             elif args.command == "stats":
                 emit(engine.stats())
             elif args.command == "reset":

@@ -67,3 +67,65 @@ def test_removed_model_option_is_rejected():
     with pytest.raises(SystemExit) as exc:
         parser().parse_args(["--model", "model.gguf", "stats"])
     assert exc.value.code == 2
+
+
+def test_cli_selects_ollama_and_reports_model_failure(tmp_path, capsys, monkeypatch):
+    calls = []
+
+    class BatchModel:
+        name = "Ollama test (local)"
+        fail = False
+
+        def __init__(self, model, endpoint, timeout):
+            calls.append((model, endpoint, timeout))
+
+        def rerank(self, context, texts, pinyin=""):
+            if self.fail:
+                raise RuntimeError("private input must never be logged")
+            return [1, 0]
+
+    monkeypatch.setattr("smart_im.ollama_model.OllamaReranker", BatchModel)
+    args = [
+        "--data-dir",
+        str(tmp_path),
+        "rerank",
+        "事实",
+        "实施",
+        "--context",
+        "执行",
+        "--backend",
+        "ollama",
+        "--model",
+        "qwen3:1.7b",
+        "--model-timeout",
+        "15",
+    ]
+    assert main(args) == 0
+    assert calls == [("qwen3:1.7b", "http://127.0.0.1:11434", 15.0)]
+    assert json.loads(capsys.readouterr().out)["order"] == [1, 0]
+    BatchModel.fail = True
+    assert main(args) == 1
+    output = capsys.readouterr()
+    assert json.loads(output.out)["order"] == [0, 1]
+    assert "模型不可用" in output.err
+    assert "private input" not in output.err
+
+
+def test_cli_rejects_remote_ollama_endpoint_before_sending_input(capsys):
+    assert (
+        main(
+            [
+                "rerank",
+                "事实",
+                "实施",
+                "--context",
+                "执行",
+                "--backend",
+                "ollama",
+                "--ollama-url",
+                "https://example.com",
+            ]
+        )
+        == 1
+    )
+    assert "local HTTP origin" in capsys.readouterr().err

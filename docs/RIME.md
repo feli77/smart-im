@@ -24,12 +24,35 @@ Windows 默认用户目录为 `%APPDATA%\Rime`。自定义目录使用 `install-
 
 保持终端运行，Ctrl+C 退出。安装依赖后，服务运行无需网络或 API key。
 
+上述命令使用自带演示模型。使用通用开源模型时，先安装并启动 [Ollama](https://ollama.com/download/windows)，然后：
+
+```powershell
+ollama pull qwen3:1.7b
+ollama run qwen3:1.7b
+# 完成一句测试后输入 /bye，保留 Ollama 后台运行
+.\.venv\Scripts\python.exe -m smart_im serve --backend ollama --model qwen3:1.7b
+```
+
+较低资源可选 `qwen3:0.6b`。初次下载需网络；服务只支持本机回环地址，默认 `http://127.0.0.1:11434`，可用 `--ollama-url` 改端口。`--model-timeout` 为 0.1–20 秒，默认 10 秒；冷启动可先通过 `ollama run` 预热。自定义 Rime 用户目录仍要传 `--user-dir`。PowerShell 启动脚本也支持 `scripts/start.ps1 -Backend ollama -Model qwen3:1.7b`。
+
+可以先独立检查模型连接和重排结果，再测试输入法：
+
+```powershell
+.\.venv\Scripts\python.exe -m smart_im rerank 实时 事实 实施 --context 我们计划 --pinyin shishi --backend ollama --model qwen3:1.7b
+```
+
+命令失败会返回非零退出码并保留原序。服务未开、模型未下载、超时或返回无效排列都会回退；不会自动下载或悄悄切换到 tiny。Qwen 是整组候选的提示重排，并不生成新的候选词；它的准确率与延迟尚待实测。
+
 1. 输入拼音，先显示 Rime 基础候选。
 2. 按 Tab 应用当前快照已完成的排序。未完成时保留原序，提示稍后再按 Tab。
 3. 用空格或数字按 Rime 原有方式上屏。
 4. 删改拼音、移动组合输入光标或改变候选后，旧结果失效。
 
 示例：先确认“我们计划”，再输入 `shishi`，稍等后按 Tab，观察“实施”的位置。自带模型覆盖有限语料，并非每次输入都会改序；无上下文且未学习时保持原序。
+
+已修复原先“前 9 项混有不同拼音范围时不提交请求，却一直显示计算中”的问题。现在只重排首候选同范围的子集，单字等其他范围候选留在原槽位；不足两项、超出限制或写入失败会明确提示，不再伪装成后台计算。成功处理也可能保持原序。
+
+从旧版升级时运行 `install-rime --force`，然后在小狼毫菜单**重新部署**并重启 Smart IM 服务。安装会备份本项目旧文件；仅修改仓库或重启服务不会替换已安装的 Lua。
 
 ## 个人学习与管理
 
@@ -53,10 +76,10 @@ Windows 默认用户目录为 `%APPDATA%\Rime`。自定义目录使用 `install-
 
 ## 当前边界
 
-- 只增强前 9 个范围一致的候选；后台结果须通过 Tab 应用。
+- 只增强前 9 项中与首候选拼音范围一致的子集；后台结果须通过 Tab 应用。
 - 只观察当前 Rime 会话的已确认文本，无法保证识别同一应用内全部鼠标移动或控件切换。需要时可关闭方案 AI 和学习开关。
 - 文件信箱存在轮询和文件系统开销；基础输入不等待模型，服务不可用时保留原候选。
-- 自动化测试模拟 Rime 对象，尚未完成真实小狼毫部署与上屏验收。
+- 用户已验证真实小狼毫界面与输入正常；混合候选修复和 Qwen 后端仍需重新实测。自动化测试模拟 Rime 对象和 Ollama 输出。
 
 ## Windows 人工验收
 

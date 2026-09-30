@@ -55,7 +55,10 @@ class LuaHarness:
               function ctx:set_property(name, value) self.properties[name] = value end
               function ctx:get_commit_text() return self.commit_text end
               function ctx:has_menu() return self.input ~= '' end
-              function ctx:refresh_non_confirmed_composition() self.refreshes = self.refreshes + 1 end
+              function ctx:refresh_non_confirmed_composition()
+                self.refreshes = self.refreshes + 1
+                if self.refresh_callback then self.refresh_callback() end
+              end
               ctx.composition = {}
               function ctx.composition:empty() return ctx.input == '' end
               function ctx.composition:back() return ctx.segment end
@@ -137,6 +140,10 @@ class LuaHarness:
     def press(self, code=0xFF09, **flags):
         key = self.lua.globals().make_key(code, self.lua.table_from(flags))
         return self.module.processor.func(key, self.processor_env)
+
+    def enable_refresh(self):
+        """Simulate Rime rebuilding its translation synchronously on refresh."""
+        self.context.refresh_callback = self.filter
 
     def response(self, order="2,1,3", *, session=None, revision=None, status="ok"):
         request = parse_rank_request(self.request_path.read_bytes())
@@ -269,10 +276,95 @@ def test_approved_order_is_invalidated_by_changed_snapshot(bridge, change):
     assert identities(bridge.filter()) == [1, 2, 3]
 
 
-def test_mixed_candidate_spans_are_never_sent_or_reordered(bridge):
+def test_mixed_candidate_spans_only_reorder_matching_slots(bridge):
     bridge.candidates[2]._end = 3
     assert identities(bridge.filter()) == [1, 2, 3]
+    request = parse_rank_request(bridge.request_path.read_bytes())
+    assert request.pinyin == "shishi"
+    assert request.candidates == ("事实", "实施")
+    originals = bridge.candidates
+    bridge.response("2,1")
+    bridge.press()
+    output = bridge.filter()
+    assert identities(output) == [3, 2, 1]
+    assert all(
+        bridge.lua.eval("rawequal")(candidate, originals[index])
+        for candidate, index in zip(output, [3, 2, 1], strict=True)
+    )
+    assert output[1].comment == "comment2"
+    assert output[1]._end == 3
+
+
+def test_mixed_candidate_spans_invalidate_when_an_unranked_slot_changes(bridge):
+    bridge.candidates[2]._end = 3
+    bridge.filter()
+    bridge.response("2,1")
+    bridge.press()
+    assert identities(bridge.filter()) == [3, 2, 1]
+    previous = parse_rank_request(bridge.request_path.read_bytes()).revision
+    bridge.candidates[2].comment = "new partial candidate"
+    assert identities(bridge.filter()) == [1, 2, 3]
+    assert parse_rank_request(bridge.request_path.read_bytes()).revision > previous
+    bridge.press()
+    assert identities(bridge.filter()) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_one_eligible_candidate_never_claims_to_be_computing(bridge, mixed):
+    if mixed:
+        bridge.candidates[2]._end = 3
+        bridge.candidates[3]._end = 3
+    else:
+        bridge.candidates = bridge.make_candidates(["事实"])
+    bridge.enable_refresh()
+    original = identities(bridge.filter())
+    for _ in range(3):
+        assert bridge.press() == 1
+        assert "无需AI排序" in bridge.context.segment.prompt
+        assert "计算中" not in bridge.context.segment.prompt
+        assert identities(bridge.filter()) == original
+        assert not bridge.request_path.exists()
+
+
+def test_request_write_failure_is_visible_and_tab_can_retry(bridge):
+    bridge.lua.execute(
+        """
+        original_open = io.open
+        io.open = function(path, mode)
+          if path:match('%.request%.tmp$') then return nil end
+          return original_open(path, mode)
+        end
+        """
+    )
+    bridge.enable_refresh()
+    bridge.filter()
+    assert bridge.press() == 1
+    assert "请求写入失败" in bridge.context.segment.prompt
+    assert "计算中" not in bridge.context.segment.prompt
     assert not bridge.request_path.exists()
+    bridge.lua.execute("io.open = original_open")
+    bridge.press()
+    assert bridge.request_path.exists()
+    assert "计算中" in bridge.context.segment.prompt
+    bridge.response()
+    bridge.press()
+    assert identities(bridge.filter()) == [2, 1, 3]
+
+
+def test_timeout_is_visible_without_starving_late_response(bridge):
+    bridge.filter()
+    request = bridge.request_path.read_bytes()
+    bridge.lua.globals().now += 25
+    bridge.heartbeat()
+    for _ in range(3):
+        assert bridge.press() == 1
+        assert "响应超时" in bridge.context.segment.prompt
+        assert "计算中" not in bridge.context.segment.prompt
+        assert bridge.request_path.read_bytes() == request
+    assert bridge.context.refreshes == 0
+    bridge.response()
+    bridge.press()
+    assert identities(bridge.filter()) == [2, 1, 3]
 
 
 def test_request_pinyin_uses_the_candidates_shared_segment(bridge):
@@ -407,6 +499,10 @@ def test_overlong_fields_never_write_a_request(bridge, field):
         bridge.candidates[1].text = "你" * 65
     assert identities(bridge.filter()) == [1, 2, 3]
     assert not bridge.request_path.exists()
+    bridge.enable_refresh()
+    bridge.press()
+    assert "无法AI排序" in bridge.context.segment.prompt
+    assert "计算中" not in bridge.context.segment.prompt
 
 
 def test_component_cleanup_disconnects_notifiers_only_after_last_reference(bridge):

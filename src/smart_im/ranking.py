@@ -6,7 +6,7 @@ import math
 import unicodedata
 from collections.abc import Mapping
 
-from .types import LanguageModel
+from .types import CandidateReranker, LanguageModel
 
 
 def external_pinyin_key(raw: str) -> str:
@@ -36,27 +36,41 @@ def external_pinyin_key(raw: str) -> str:
 def rank_external(
     texts: list[str],
     context: str,
-    model: LanguageModel,
+    model: LanguageModel | CandidateReranker,
     word_counts: Mapping[str, int],
     context_counts: Mapping[str, float],
+    pinyin: str = "",
 ) -> list[int]:
     """Rank indices, preserving duplicates and Rime's order as the baseline prior.
 
-    Model evidence is contextual gain over its own empty-context score, capped
-    at three log units. No context means no model call. This deliberately leaves
+    Scoring models use contextual gain over an empty-context score, capped at
+    three log units. Batch rerankers supply the prior order directly. No context
+    means no model call. This deliberately leaves
     ordinary dictionary ranking to Rime. Any model error is propagated so the
     caller can discard the entire attempted reranking, including personal boosts.
     """
     scores: list[float] = []
     evidence: dict[str, float] = {}
+    positions = list(range(len(texts)))
+    batch = isinstance(model, CandidateReranker)
+    if context.strip() and batch:
+        order = model.rerank(context, list(texts), pinyin)
+        if (
+            not isinstance(order, list)
+            or any(type(index) is not int for index in order)
+            or sorted(order) != list(range(len(texts)))
+        ):
+            raise ValueError("Invalid candidate permutation")
+        for position, index in enumerate(order):
+            positions[index] = position
     for index, text in enumerate(texts):
-        if context.strip() and text not in evidence:
+        if context.strip() and not batch and text not in evidence:
             conditional = float(model.score(context, text))
             baseline = float(model.score("", text))
             if not math.isfinite(conditional) or not math.isfinite(baseline):
                 raise ValueError("Non-finite language model score")
             evidence[text] = max(-3.0, min(3.0, conditional - baseline))
-        score = -0.35 * index + 0.85 * evidence.get(text, 0.0)
+        score = -0.35 * positions[index] + 0.85 * evidence.get(text, 0.0)
         score += min(8.0, 2.8 * math.log1p(word_counts.get(text, 0)))
         score += min(4.0, 1.4 * math.log1p(context_counts.get(text, 0)))
         scores.append(score)

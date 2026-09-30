@@ -3,6 +3,10 @@
 local M = { processor = {}, filter = {} }
 local sessions, serial = {}, 0
 local MAX_CANDIDATES, MAX_INPUT, MAX_TEXT, MAX_CONTEXT = 9, 96, 64, 128
+local REQUEST_TIMEOUT = 25
+local PENDING = "AI计算中，请稍后再按Tab"
+local UNAVAILABLE = "当前候选无法AI排序，保留原候选"
+local UNNEEDED = "当前候选无需AI排序，保留原候选"
 
 local function hex(value)
   return (value:gsub(".", function(byte) return string.format("%02x", string.byte(byte)) end))
@@ -54,7 +58,8 @@ end
 
 local function invalidate(state)
   state.revision = state.revision + 1
-  state.snapshot, state.approved, state.sent = nil, nil, nil
+  state.snapshot, state.approved, state.sent, state.sent_at = nil, nil, nil, nil
+  state.unavailable, state.retry = nil, nil
 end
 
 local function reset_history(state)
@@ -152,25 +157,35 @@ local function fini(env)
 end
 
 local function snapshot_of(state, context, candidates)
-  if #candidates == 0 or not bounded(context.input, MAX_INPUT) then return nil end
+  if #candidates == 0 or not bounded(context.input, MAX_INPUT) then return nil, nil, UNAVAILABLE end
   local first = candidates[1]
   local start, finish = first.start, first._end
   if type(start) ~= "number" or type(finish) ~= "number" or start < 0
-      or finish <= start or finish > #context.input then return nil end
+      or finish <= start or finish > #context.input then return nil, nil, UNAVAILABLE end
   local pinyin = context.input:sub(start + 1, finish)
   local parts = { hex(context.input), tostring(context.caret_pos), hex(state.history),
     state.learning and "1" or "0" }
-  for _, candidate in ipairs(candidates) do
-    if candidate.start ~= start or candidate._end ~= finish or candidate.text == ""
-        or not bounded(candidate.text, MAX_TEXT) then return nil end
+  local eligible, slots = {}, {}
+  for index, candidate in ipairs(candidates) do
+    if type(candidate.start) ~= "number" or type(candidate._end) ~= "number"
+        or candidate.start < 0 or candidate._end <= candidate.start
+        or candidate._end > #context.input or candidate.text == ""
+        or not bounded(candidate.text, MAX_TEXT) then return nil, nil, UNAVAILABLE end
+    -- Rime can mix whole words and partial syllable matches in the same menu.
+    -- Reorder only the first candidate's span, retaining every other slot.
+    if candidate.start == start and candidate._end == finish then
+      eligible[#eligible + 1], slots[#slots + 1] = candidate, index
+    end
     -- Identity cannot survive a new Rime translation; all ranking-relevant
     -- content and metadata must nevertheless match the exact approved snapshot.
-    parts[#parts + 1] = table.concat({ tostring(start), tostring(finish), hex(candidate.text),
+    parts[#parts + 1] = table.concat({ tostring(candidate.start), tostring(candidate._end), hex(candidate.text),
       hex(candidate.type or ""), hex(candidate.comment or ""), hex(candidate.preedit or ""),
       tostring(candidate.quality or 0) }, ":")
   end
+  if #eligible < 2 then return nil, nil, UNNEEDED end
   return { fingerprint = table.concat(parts, "|"), input = context.input,
-    caret = context.caret_pos, pinyin = pinyin, context = state.history, count = #candidates }
+    caret = context.caret_pos, pinyin = pinyin, context = state.history,
+    count = #eligible, slots = slots }, eligible
 end
 
 local function request(state, snapshot, candidates)
@@ -182,7 +197,9 @@ local function request(state, snapshot, candidates)
   for _, candidate in ipairs(candidates) do lines[#lines + 1] = hex(candidate.text) end
   lines[#lines + 1] = ""
   if atomic_write(state.directory .. "/" .. state.id .. ".request", table.concat(lines, "\n")) then
-    state.sent = state.revision
+    state.sent, state.sent_at, state.unavailable = state.revision, os.time(), nil
+  else
+    state.unavailable = "AI请求写入失败，保留原候选；请再按Tab重试"
   end
 end
 
@@ -203,19 +220,24 @@ local function filter(input, env)
     if not candidate then break end
     candidates[#candidates + 1] = candidate
   end
-  local snapshot = snapshot_of(state, context, candidates)
+  local snapshot, eligible, unavailable = snapshot_of(state, context, candidates)
   if not snapshot then
     if state.snapshot then invalidate(state) end
+    state.unavailable = unavailable
   else
     if not state.snapshot or state.snapshot.fingerprint ~= snapshot.fingerprint then
       invalidate(state)
       state.snapshot = snapshot
     end
-    request(state, snapshot, candidates)
+    request(state, snapshot, eligible)
   end
   local approved = state.approved
   if snapshot and approved and approved.fingerprint == snapshot.fingerprint then
-    for _, index in ipairs(approved.order) do yield(candidates[index]) end
+    local replacements = {}
+    for index, slot in ipairs(snapshot.slots) do
+      replacements[slot] = eligible[approved.order[index]]
+    end
+    for index, candidate in ipairs(candidates) do yield(replacements[index] or candidate) end
   else
     for _, candidate in ipairs(candidates) do yield(candidate) end
   end
@@ -245,6 +267,12 @@ local navigation = { [0xff1b] = true, [0xff50] = true, [0xff51] = true, [0xff52]
   [0xff53] = true, [0xff54] = true, [0xff55] = true, [0xff56] = true, [0xff57] = true,
   [0xffff] = true }
 
+local function request_prompt(state)
+  if state.unavailable then return state.unavailable end
+  if state.snapshot and state.sent == state.revision then return PENDING end
+  return UNAVAILABLE
+end
+
 local function processor(key, env)
   local state, context = env.smart_im_state, env.engine.context
   synchronize(state, context)
@@ -261,22 +289,38 @@ local function processor(key, env)
     prompt(context, "AI服务未运行，保留原候选")
     return 1
   end
-  if not state.snapshot then
+  local order, status = ready_order(state)
+  if state.retry and not order then
+    invalidate(state)
+    context:refresh_non_confirmed_composition()
+    prompt(context, request_prompt(state))
+    return 1
+  end
+  if not state.snapshot or state.sent ~= state.revision then
     -- The service may have started after this menu was first displayed, or the
     -- context may just have expired. Rebuild to submit a fresh base snapshot.
     context:refresh_non_confirmed_composition()
-    prompt(context, "AI计算中，请稍后再按Tab")
+    prompt(context, request_prompt(state))
     return 1
   end
-  local order, status = ready_order(state)
   if not order then
+    if status == "fallback" then
+      state.retry = true
+      prompt(context, "AI暂不可用，保留原候选；请再按Tab重试")
+      return 1
+    end
     -- The service expires idle mailbox files. An unchanged composition still
     -- needs a new revision after cleanup; keep a live in-flight request intact.
     if not read_file(state.directory .. "/" .. state.id .. ".request", 16384) then
       invalidate(state)
       context:refresh_non_confirmed_composition()
+    elseif state.sent_at and os.time() - state.sent_at >= REQUEST_TIMEOUT then
+      -- Keep this revision alive: queued local inference can still complete.
+      -- Repeated Tab must not replace its request and starve a slow worker.
+      prompt(context, "AI响应超时，保留原候选；可稍后再按Tab")
+      return 1
     end
-    prompt(context, status == "fallback" and "AI暂不可用，保留原候选" or "AI计算中，请稍后再按Tab")
+    prompt(context, request_prompt(state))
     return 1
   end
   state.approved = { fingerprint = state.snapshot.fingerprint, order = order }
