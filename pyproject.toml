@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "smart-im"
-version = "0.3.0"
+version = "0.4.0"
 description = "Rime candidate reranking with local Ollama/Qwen"
 readme = "README.md"
 requires-python = ">=3.10"

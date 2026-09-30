@@ -2,6 +2,11 @@
 
 Generated from Git history with git-cliff. Changes without a version tag appear under Unreleased.
 
+## [0.4.0] - 2026-09-30
+
+### Refactoring
+
+- **models:** **BREAKING:** Retain only Ollama Qwen reranking
 ## [0.3.0] - 2026-09-30
 
 ### Features
