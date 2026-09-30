@@ -96,7 +96,7 @@ def test_permutation_validation_is_strict(order):
 
 def test_worker_ranks_once_and_returns_only_one_based_indices(tmp_path):
     engine = FakeEngine()
-    with MailboxService(tmp_path, engine) as service:
+    with MailboxService(tmp_path, engine, debounce_interval=0) as service:
         (tmp_path / "test-session.request").write_bytes(message())
         service.poll_once()
         service.poll_once()
@@ -119,7 +119,7 @@ def test_worker_ranks_once_and_returns_only_one_based_indices(tmp_path):
 @pytest.mark.parametrize("client_learns", [True, False])
 def test_personal_reads_and_commits_require_both_opt_ins(tmp_path, service_learns, client_learns):
     engine = FakeEngine(learning=service_learns)
-    with MailboxService(tmp_path, engine) as service:
+    with MailboxService(tmp_path, engine, debounce_interval=0) as service:
         (tmp_path / "test-session.request").write_bytes(message(learning=client_learns))
         commit = tmp_path / "test-session.1.commit"
         commit.write_bytes(message("COMMIT", learning=client_learns, texts=("世界",)))
@@ -132,7 +132,7 @@ def test_personal_reads_and_commits_require_both_opt_ins(tmp_path, service_learn
 
 def test_model_failure_and_invalid_order_fall_back_without_raw_error(tmp_path):
     engine = FakeEngine(order=[0, 0, 0])
-    with MailboxService(tmp_path, engine) as service:
+    with MailboxService(tmp_path, engine, debounce_interval=0) as service:
         path = tmp_path / "test-session.request"
         path.write_bytes(message())
         service.poll_once()
@@ -151,7 +151,7 @@ def test_model_failure_and_invalid_order_fall_back_without_raw_error(tmp_path):
 
 def test_old_inference_cannot_overwrite_a_new_composition(tmp_path):
     engine = FakeEngine()
-    with MailboxService(tmp_path, engine) as service:
+    with MailboxService(tmp_path, engine, debounce_interval=0) as service:
         path = tmp_path / "test-session.request"
         path.write_bytes(message())
         original = engine.rerank
@@ -169,7 +169,7 @@ def test_old_inference_cannot_overwrite_a_new_composition(tmp_path):
 
 
 def test_failed_atomic_response_is_retried(tmp_path, monkeypatch):
-    with MailboxService(tmp_path, FakeEngine()) as service:
+    with MailboxService(tmp_path, FakeEngine(), debounce_interval=0) as service:
         (tmp_path / "test-session.request").write_bytes(message())
         original = os.replace
 
@@ -232,7 +232,7 @@ def test_old_commits_are_processed_before_new_requests(tmp_path):
     order = []
     engine.commit_external = lambda pinyin, text, **kwargs: order.append(text)
     engine.rerank = lambda *args, **kwargs: order.append("rank") or [0, 1, 2]
-    with MailboxService(tmp_path, engine) as service:
+    with MailboxService(tmp_path, engine, debounce_interval=0) as service:
         stamp = time.time()
         for seq in [2, 1]:
             path = tmp_path / f"test-session.{seq}.commit"
@@ -403,7 +403,7 @@ def test_slow_model_does_not_block_heartbeat_and_shutdown_stops_thread(tmp_path,
 
 def test_latest_active_session_gets_priority_and_requests_are_rescanned(tmp_path):
     engine = FakeEngine()
-    with MailboxService(tmp_path, engine) as service:
+    with MailboxService(tmp_path, engine, debounce_interval=0) as service:
         stamp = time.time()
         for session, age in [("older", 2), ("active", 1)]:
             path = tmp_path / f"{session}.request"
@@ -416,3 +416,81 @@ def test_latest_active_session_gets_priority_and_requests_are_rescanned(tmp_path
         assert [call[1]["pinyin"] for call in engine.ranks] == ["active", "newest"]
         service.poll_once()
         assert [call[1]["pinyin"] for call in engine.ranks] == ["active", "newest", "older"]
+
+
+def test_debounce_ranks_only_the_latest_spelling_after_a_quiet_period(tmp_path, monkeypatch):
+    engine = FakeEngine()
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    with MailboxService(tmp_path, engine) as service:
+        path = tmp_path / "test-session.request"
+        for revision, pinyin in enumerate(["sh", "shij", "shijie"], 1):
+            clock[0] += 0.04
+            path.write_bytes(message(sequence=revision, pinyin=pinyin))
+            service.poll_once()
+            assert not engine.ranks
+        clock[0] += 0.07
+        service.poll_once()
+        assert not engine.ranks
+        assert not (tmp_path / "test-session.response").exists()
+        clock[0] += 0.02
+        service.poll_once()
+        assert [call[1]["pinyin"] for call in engine.ranks] == ["shijie"]
+        assert "\t3\tok\n" in (tmp_path / "test-session.response").read_text()
+
+
+def test_debounce_uses_observed_content_not_file_modification_time(tmp_path, monkeypatch):
+    engine = FakeEngine()
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    with MailboxService(tmp_path, engine) as service:
+        path = tmp_path / "test-session.request"
+        path.write_bytes(message())
+        os.utime(path, (time.time() + 1000, time.time() + 1000))
+        service.poll_once()
+        assert not engine.ranks
+        clock[0] += 0.1
+        path.write_bytes(message())
+        service.poll_once()
+        assert len(engine.ranks) == 1
+
+
+def test_new_composition_debounce_prevents_older_session_blocking_it(tmp_path, monkeypatch):
+    engine = FakeEngine()
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    with MailboxService(tmp_path, engine) as service:
+        older = tmp_path / "older.request"
+        older.write_bytes(message(session="older", pinyin="older"))
+        stamp = time.time() - 1
+        os.utime(older, (stamp, stamp))
+        service.poll_once()
+        clock[0] += 0.1
+        (tmp_path / "active.request").write_bytes(message(session="active", pinyin="active"))
+        service.poll_once()
+        assert not engine.ranks
+        clock[0] += 0.1
+        service.poll_once()
+        assert [call[1]["pinyin"] for call in engine.ranks] == ["active"]
+        service.poll_once()
+        assert [call[1]["pinyin"] for call in engine.ranks] == ["active", "older"]
+
+
+def test_debounce_does_not_delay_commits_or_heartbeat(tmp_path, monkeypatch):
+    engine = FakeEngine(learning=True)
+    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
+    with MailboxService(tmp_path, engine) as service:
+        (tmp_path / "test-session.request").write_bytes(message(learning=True))
+        commit = tmp_path / "test-session.1.commit"
+        commit.write_bytes(message("COMMIT", learning=True, texts=("世界",)))
+        service.poll_once()
+        assert not engine.ranks
+        assert len(engine.commits) == 1
+        assert not commit.exists()
+        assert (tmp_path / "heartbeat").exists()
+
+
+@pytest.mark.parametrize("debounce_interval", [-0.01, 1.01, float("nan")])
+def test_debounce_interval_validation(tmp_path, debounce_interval):
+    with pytest.raises(ValueError, match="debounce_interval"):
+        MailboxService(tmp_path, FakeEngine(), debounce_interval=debounce_interval)

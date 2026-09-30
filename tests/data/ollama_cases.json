@@ -1,0 +1,33 @@
+{
+  "description": "28 个人工编写和标注的同音词诊断例子，包含用户报告和用于排查提示词的例子。候选顺序人为固定，既有原序正确也有错误的情况，不能当作真实 Rime 分布或代表性准确率。这不是独立验证集；修改提示词后需另备未见过的数据。多项 expected_first 表示该片段允许多个合理续写。",
+  "cases": [
+    {"id": "zhanshi-user", "context": "铁血", "pinyin": "zhanshi", "candidates": ["展示", "战士", "战事", "战时"], "expected_first": ["战士"]},
+    {"id": "zhanshi-display", "context": "博物馆正在对外", "pinyin": "zhanshi", "candidates": ["战士", "展示", "战事", "战时"], "expected_first": ["展示"]},
+    {"id": "fangan-user", "context": "解决", "pinyin": "fangan", "candidates": ["反感", "方案"], "expected_first": ["方案"]},
+    {"id": "fangan-dislike", "context": "我对这种欺骗行为十分", "pinyin": "fangan", "candidates": ["方案", "反感"], "expected_first": ["反感"]},
+    {"id": "fangan-adopt", "context": "大家讨论后决定采用这个", "pinyin": "fangan", "candidates": ["方案", "反感"], "expected_first": ["方案"]},
+    {"id": "fangan-coerce", "context": "总是强迫别人会让人", "pinyin": "fangan", "candidates": ["反感", "方案"], "expected_first": ["反感"]},
+    {"id": "shishi-facts", "context": "我们必须尊重客观", "pinyin": "shishi", "candidates": ["实施", "事实", "试试", "时时", "实时", "逝世", "时事", "史诗"], "expected_first": ["事实"]},
+    {"id": "shishi-implement", "context": "这项政策明天开始", "pinyin": "shishi", "candidates": ["事实", "试试", "实施", "实时", "逝世", "史诗"], "expected_first": ["实施"]},
+    {"id": "shishi-method", "context": "这个办法值得", "pinyin": "shishi", "candidates": ["事实", "试试", "实施", "时事", "史诗"], "expected_first": ["试试", "实施"]},
+    {"id": "shishi-death", "context": "他因病不幸", "pinyin": "shishi", "candidates": ["事实", "实施", "逝世", "时时", "时事"], "expected_first": ["逝世"]},
+    {"id": "shishi-epic", "context": "这首长诗被誉为民族", "pinyin": "shishi", "candidates": ["实时", "事实", "史诗", "时事", "实施"], "expected_first": ["史诗"]},
+    {"id": "shishi-news", "context": "新闻节目每天评论国际", "pinyin": "shishi", "candidates": ["时事", "史诗", "试试", "实时", "逝世"], "expected_first": ["时事"]},
+    {"id": "yiyi-meaning", "context": "这件事很有", "pinyin": "yiyi", "candidates": ["异议", "意义", "一一", "疑义"], "expected_first": ["意义"]},
+    {"id": "yiyi-objection", "context": "他对这项提案提出了", "pinyin": "yiyi", "candidates": ["意义", "一一", "异议", "疑义"], "expected_first": ["异议", "疑义"]},
+    {"id": "yiyi-sequence", "context": "这些问题需要按顺序", "pinyin": "yiyi", "candidates": ["一一", "意义", "异议", "疑义"], "expected_first": ["一一"]},
+    {"id": "gongshi-notice", "context": "录用名单正在网上", "pinyin": "gongshi", "candidates": ["公式", "共识", "公示", "共事", "攻势"], "expected_first": ["公示"]},
+    {"id": "gongshi-formula", "context": "计算圆面积要用这个", "pinyin": "gongshi", "candidates": ["共事", "公示", "公式", "共识"], "expected_first": ["公式"]},
+    {"id": "gongshi-colleague", "context": "我们曾在同一家公司", "pinyin": "gongshi", "candidates": ["共识", "公式", "共事", "公示"], "expected_first": ["共事"]},
+    {"id": "gongshi-consensus", "context": "双方经过沟通终于达成", "pinyin": "gongshi", "candidates": ["共识", "公式", "共事", "攻势"], "expected_first": ["共识"]},
+    {"id": "quanli-right", "context": "公民依法享有的基本", "pinyin": "quanli", "candidates": ["权力", "权利", "全力"], "expected_first": ["权利"]},
+    {"id": "quanli-power", "context": "领导不能滥用手中的", "pinyin": "quanli", "candidates": ["权利", "全力", "权力"], "expected_first": ["权力"]},
+    {"id": "quanli-effort", "context": "这场比赛我们必须拼尽", "pinyin": "quanli", "candidates": ["全力", "权利", "权力"], "expected_first": ["全力"]},
+    {"id": "zhili-govern", "context": "解决河流污染需要系统", "pinyin": "zhili", "candidates": ["智力", "治理", "致力", "直立"], "expected_first": ["治理"]},
+    {"id": "zhili-intellect", "context": "这项测验用于评估儿童", "pinyin": "zhili", "candidates": ["治理", "致力", "智力", "直立"], "expected_first": ["智力"]},
+    {"id": "shiwu-error", "context": "这次事故是因为操作", "pinyin": "shiwu", "candidates": ["食物", "事物", "失误", "事务", "实物"], "expected_first": ["失误"]},
+    {"id": "shiwu-food", "context": "餐桌上摆满了美味的", "pinyin": "shiwu", "candidates": ["食物", "失误", "事务", "实物"], "expected_first": ["食物"]},
+    {"id": "jingyan-experience", "context": "他有丰富的临床", "pinyin": "jingyan", "candidates": ["惊艳", "经验", "敬烟"], "expected_first": ["经验"]},
+    {"id": "jingyan-amazing", "context": "她的舞台表现令人", "pinyin": "jingyan", "candidates": ["经验", "惊艳", "敬烟"], "expected_first": ["惊艳"]}
+  ]
+}

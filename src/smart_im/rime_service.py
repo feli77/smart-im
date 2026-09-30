@@ -35,26 +35,35 @@ MAX_COMMITS = 4096
 class MailboxService:
     """Own one dedicated runtime directory and one engine until ``close``.
 
-    Rank requests replace older requests from their session. Commits are separate
-    files and deduplicated in memory after success; this is deliberately not a
-    durable exactly-once queue. Pending commits expire after thirty seconds.
+    Rank requests replace older requests from their session and wait for an
+    80 ms quiet period by default. Commits are separate files, processed without
+    that delay, and deduplicated in memory after success; this is deliberately
+    not a durable exactly-once queue. Pending commits expire after thirty seconds.
     """
 
     def __init__(
-        self, runtime_dir: Path | str, engine: Engine, poll_interval: float = 0.02
+        self,
+        runtime_dir: Path | str,
+        engine: Engine,
+        poll_interval: float = 0.02,
+        debounce_interval: float = 0.08,
     ) -> None:
         if not 0.001 <= poll_interval <= 1.0:
             raise ValueError("poll_interval must be between 0.001 and 1 second")
+        if not 0 <= debounce_interval <= 1.0:
+            raise ValueError("debounce_interval must be between 0 and 1 second")
         self.runtime_dir = Path(runtime_dir)
         self.runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.engine = engine
         self.poll_interval = poll_interval
+        self.debounce_interval = debounce_interval
         self._closed = False
         self._heartbeat_at = float("-inf")
         self._heartbeat_lock = threading.Lock()
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._processed: OrderedDict[str, bytes] = OrderedDict()
+        self._pending: OrderedDict[str, tuple[bytes, float]] = OrderedDict()
         self._committed: OrderedDict[tuple[str, int], None] = OrderedDict()
         self._lock_file = (self.runtime_dir / "service.lock").open("a+b")
         try:
@@ -135,6 +144,7 @@ class MailboxService:
             if now - stat.st_mtime > STALE_SECONDS:
                 self._unlink(path)
                 self._processed.pop(path.name, None)
+                self._pending.pop(path.name, None)
                 continue
             if request:
                 requests.append((stat.st_mtime_ns, path))
@@ -145,11 +155,12 @@ class MailboxService:
         return [item[1] for item in requests], [item[2] for item in commits]
 
     def _rank(self, path: Path) -> bool:
-        """Return whether inference was attempted; skip idle or expired sessions."""
+        """Return whether this request should stop the scan of older sessions."""
         try:
             if time.time() - path.stat().st_mtime > STALE_SECONDS:
                 self._unlink(path)
                 self._processed.pop(path.name, None)
+                self._pending.pop(path.name, None)
                 return False
         except OSError:
             return False
@@ -163,6 +174,17 @@ class MailboxService:
         except ValueError:
             self._remember(self._processed, path.name, data, MAX_SESSIONS)
             return False
+        if self.debounce_interval:
+            now = time.monotonic()
+            pending = self._pending.get(path.name)
+            if pending is None or pending[0] != data:
+                pending = (data, now)
+                self._remember(self._pending, path.name, pending, MAX_SESSIONS)
+            if now - pending[1] < self.debounce_interval:
+                # Coalesce intermediate spellings before starting slow inference.
+                # Do not let an older session occupy the model during this wait.
+                # Commits and heartbeats still run on every poll.
+                return True
         fallback = False
         try:
             order = self.engine.rerank(
@@ -184,6 +206,7 @@ class MailboxService:
         response = self.runtime_dir / f"{request.session}.response"
         if self._atomic_write(response, render_response(request, order, fallback=fallback)):
             self._remember(self._processed, path.name, data, MAX_SESSIONS)
+            self._pending.pop(path.name, None)
         return True
 
     def _commit(self, path: Path) -> bool:

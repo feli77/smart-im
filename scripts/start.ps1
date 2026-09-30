@@ -4,7 +4,7 @@ param(
     [switch]$Learn,
     [ValidateSet("tiny", "ollama")]
     [string]$Backend = "tiny",
-    [string]$Model = "qwen3:0.6b",
+    [string]$Model = "qwen3:1.7b",
     [ValidateRange(0.1, 20)]
     [double]$ModelTimeout = 10
 )

@@ -33,7 +33,9 @@ ollama run qwen3:1.7b
 .\.venv\Scripts\python.exe -m smart_im serve --backend ollama --model qwen3:1.7b
 ```
 
-也可使用较小的 `qwen3:0.6b`。首次下载需要网络；推理只调用本机 Ollama。每次提交整组候选，关闭 Qwen3 思考模式，校验返回的索引排列后再供 Tab 应用。服务打印正在使用的模型；不加 `--backend ollama` 仍使用演示模型。当前尚未完成真实 Qwen 权重的延迟和排序质量验收，接入不代表已证明准确率提升。
+Ollama 后端默认使用 `qwen3:1.7b`，也可显式指定 `qwen3:0.6b`。首次下载需要网络；推理只调用本机 Ollama。模型比较“上下文 + 候选”的完整短语，只选择最佳索引；将该项提升到首位，其余保持 Rime 原序，关闭 Qwen3 思考模式。启用个人学习后，个人统计仍可进一步调整顺序。服务打印正在使用的模型；不加 `--backend ollama` 仍使用演示模型。
+
+已在 RTX 5060 Laptop 上确认 Ollama 使用 GPU，并用真实权重复测“铁血 → 战士”“解决 → 方案”。0.6B 的整组排序判断不可靠；更小的兼容选项有 `qwen2.5:0.5b`，但本项目未验证其质量。小样本对比、耗时与局限见 [验证记录](docs/VALIDATION.md)，GPU 检查和延迟排查见 [Rime 使用说明](docs/RIME.md#gpu-与延迟排查)。
 
 升级已有安装时，需要更新 Lua 并在小狼毫中**重新部署**，只重启 Python 不会更新已安装的适配器：
 
@@ -49,7 +51,7 @@ ollama run qwen3:1.7b
 
 - 在前 9 项中只重排与首候选拼音范围一致的候选，其他范围固定原位，保留 Rime Candidate 对象和元数据。
 - Lua 与 Python 通过有界的本地文件信箱通信；输入过程不等待模型完成。
-- 上下文来自当前 Rime 会话的有限确认文本，不读取应用正文；同一应用内的控件切换仍需真机验证。
+- 上下文来自当前 Rime 会话的有限上屏文本及候选前已选的分段，不读取应用正文；同一应用内的控件切换仍需真机验证。
 - 个人学习默认关闭。服务使用 `--learn` 且方案切换为“学习开启”时，才读取和写入个人统计。
 - 专用方案关闭 Rime 用户词典学习，由 SQLite 保存确认词句及最多 8 字的上下文后缀。个人数据和临时信箱均为本地明文。
 - Qwen 后端无需自己训练模型；自带字符 MLP 与 n-gram 使用有限语料，两者的排序收益都需独立质量评估。
@@ -84,7 +86,7 @@ uv build
 
 开发依赖包含 git-cliff，版本由 `uv.lock` 固定。使用 `uv run git-cliff --config cliff.toml --output CHANGELOG.md` 从提交历史更新变更记录；没有版本标签的修改归入 `Unreleased`。协作、提交与发布流程见 [AGENTS.md](AGENTS.md)。
 
-测试包含真实 Lua 运行时、文件信箱、Python 服务及模拟 Ollama HTTP 接口，Rime 对象由测试模拟。用户已反馈真实小狼毫界面和输入正常；本次修复与 Qwen 排序仍需重新实机验收。
+测试包含真实 Lua 运行时、文件信箱、Python 服务及模拟 Ollama HTTP 接口，Rime 对象由测试模拟。另有 `uv run python scripts/evaluate_ollama.py --model qwen3:1.7b --repeat 2` 可复测本机模型；本次修复仍需更新 Lua、重新部署并重启服务后验收小狼毫完整链路。
 
 项目的 schema、Lua、语料及模型权重包含在 wheel 中；第三方 `luna_pinyin` 词典需另行安装。
 

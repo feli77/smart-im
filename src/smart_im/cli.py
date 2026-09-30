@@ -34,7 +34,7 @@ def parser() -> argparse.ArgumentParser:
             default="tiny",
             help="tiny 为自带演示模型；ollama 使用本机开源模型",
         )
-        command.add_argument("--model", default="qwen3:0.6b", help="Ollama 模型名称")
+        command.add_argument("--model", default="qwen3:1.7b", help="Ollama 模型名称")
         command.add_argument(
             "--ollama-url", default="http://127.0.0.1:11434", help="本机 Ollama 地址"
         )

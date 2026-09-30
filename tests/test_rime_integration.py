@@ -36,7 +36,7 @@ def composition_after(bridge, text):
 
 def test_bundled_model_round_trip_only_changes_display_after_tab(tmp_path, bridge):
     engine = Engine(tmp_path / "personal")
-    with MailboxService(bridge.directory, engine) as service:
+    with MailboxService(bridge.directory, engine, debounce_interval=0) as service:
         service.poll_once()
         composition_after(bridge, "系统支持")
         originals = bridge.candidates
@@ -61,7 +61,7 @@ def test_bundled_model_round_trip_only_changes_display_after_tab(tmp_path, bridg
 
 def test_mixed_whole_word_and_partial_candidates_complete_round_trip(tmp_path, bridge):
     engine = Engine(tmp_path / "personal")
-    with MailboxService(bridge.directory, engine) as service:
+    with MailboxService(bridge.directory, engine, debounce_interval=0) as service:
         service.poll_once()
         composition_after(bridge, "系统支持")
         originals = bridge.make_candidates(["事实", "实", "实时", "实施", "事"])
@@ -83,13 +83,61 @@ def test_mixed_whole_word_and_partial_candidates_complete_round_trip(tmp_path, b
         assert output[1]._end == output[4]._end == 3
 
 
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize(
+    "prefix,spelling,pinyin,texts",
+    [
+        ("铁血", "tiexue", "zhanshi", ["展示", "战士", "战事"]),
+        ("解决", "jiejue", "fangan", ["反感", "方案", "翻案"]),
+    ],
+)
+def test_context_reaches_batch_ranker_and_tab_applies_its_response(
+    tmp_path, bridge, committed, prefix, spelling, pinyin, texts
+):
+    class RecordingReranker:
+        name = "recording-reranker"
+
+        def __init__(self):
+            self.calls = []
+
+        def rerank(self, context, candidates, raw_pinyin):
+            self.calls.append((context, candidates, raw_pinyin))
+            return [1, 0, 2]
+
+    model = RecordingReranker()
+    engine = Engine(tmp_path / "personal", model)
+    with MailboxService(bridge.directory, engine, debounce_interval=0) as service:
+        service.poll_once()
+        if committed:
+            bridge.commit(prefix, spelling)
+            bridge.context.input = pinyin
+            start = 0
+        else:
+            bridge.context.input = spelling + pinyin
+            start = len(spelling)
+            bridge.set_segments((prefix, 0, start, "kSelected"))
+        bridge.context.caret_pos = len(bridge.context.input)
+        originals = bridge.make_candidates(texts, start=start, finish=bridge.context.caret_pos)
+        assert identities(bridge.filter(originals)) == [1, 2, 3]
+        bridge.enable_refresh()
+        service.poll_once()
+        assert model.calls == [(prefix, texts, pinyin)]
+        assert identities(bridge.filter()) == [1, 2, 3]
+        bridge.press()
+        output = bridge.filter()
+        assert output[0].text == texts[1]
+        assert identities(output) == [2, 1, 3]
+        assert bridge.lua.eval("rawequal")(output[0], originals[2])
+        assert engine.stats()["selections"] == 0
+
+
 @pytest.mark.parametrize("service_learns", [False, True])
 @pytest.mark.parametrize("client_learns", [False, True])
 def test_commit_learning_requires_both_opt_ins_end_to_end(
     tmp_path, bridge, service_learns, client_learns
 ):
     engine = Engine(tmp_path / "personal", FlatModel(), learning=service_learns)
-    with MailboxService(bridge.directory, engine) as service:
+    with MailboxService(bridge.directory, engine, debounce_interval=0) as service:
         service.poll_once()
         bridge.option("smart_im_learning", client_learns)
         bridge.filter()
@@ -112,7 +160,7 @@ def test_commit_learning_requires_both_opt_ins_end_to_end(
 
 def test_turning_learning_off_discards_ready_personalized_result(tmp_path, bridge):
     engine = Engine(tmp_path / "personal", FlatModel(), learning=True)
-    with MailboxService(bridge.directory, engine) as service:
+    with MailboxService(bridge.directory, engine, debounce_interval=0) as service:
         service.poll_once()
         bridge.option("smart_im_learning", True)
         bridge.commit("实施")
@@ -139,7 +187,7 @@ def test_turning_learning_off_discards_ready_personalized_result(tmp_path, bridg
 
 def test_new_candidate_objects_cannot_apply_old_snapshot_response(tmp_path, bridge):
     engine = Engine(tmp_path / "personal")
-    with MailboxService(bridge.directory, engine) as service:
+    with MailboxService(bridge.directory, engine, debounce_interval=0) as service:
         service.poll_once()
         composition_after(bridge, "系统支持")
         original = bridge.candidates
@@ -163,7 +211,7 @@ def test_new_candidate_objects_cannot_apply_old_snapshot_response(tmp_path, brid
 
 def test_service_stop_discards_a_previously_ready_order(tmp_path, bridge):
     engine = Engine(tmp_path / "personal")
-    with MailboxService(bridge.directory, engine) as service:
+    with MailboxService(bridge.directory, engine, debounce_interval=0) as service:
         service.poll_once()
         composition_after(bridge, "系统支持")
         bridge.filter()
@@ -175,9 +223,49 @@ def test_service_stop_discards_a_previously_ready_order(tmp_path, bridge):
     assert not bridge.request_path.exists()
 
 
+@pytest.mark.parametrize("action", ["commit", "escape", "ai_off"])
+@pytest.mark.parametrize("inflight", [False, True])
+def test_invalidated_composition_cancels_pending_or_discards_inflight_result(
+    tmp_path, bridge, monkeypatch, action, inflight
+):
+    engine = Engine(tmp_path / "personal", FlatModel())
+    clock = [100.0]
+    calls = []
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+
+    def invalidate():
+        if action == "commit":
+            bridge.commit("事实")
+        elif action == "escape":
+            bridge.press(0xFF1B)
+        else:
+            bridge.option("smart_im_ai", False)
+
+    def rank(*args, **kwargs):
+        calls.append(args)
+        if inflight:
+            invalidate()
+        return [2, 0, 1]
+
+    monkeypatch.setattr(engine, "rerank", rank)
+    with MailboxService(bridge.directory, engine) as service:
+        service.poll_once()
+        composition_after(bridge, "系统支持")
+        bridge.filter()
+        service.poll_once()
+        assert not calls
+        if not inflight:
+            invalidate()
+        clock[0] += 0.1
+        service.poll_once()
+        assert len(calls) == int(inflight)
+        assert not bridge.request_path.exists()
+        assert not bridge.response_path.exists()
+
+
 def test_tab_recovers_after_service_expires_idle_mailbox_files(tmp_path, bridge):
     engine = Engine(tmp_path / "personal", FlatModel(), learning=True)
-    with MailboxService(bridge.directory, engine) as service:
+    with MailboxService(bridge.directory, engine, debounce_interval=0) as service:
         service.poll_once()
         bridge.option("smart_im_learning", True)
         bridge.commit("实施")
@@ -209,7 +297,7 @@ def test_real_engine_model_failure_keeps_originals_through_tab(tmp_path, bridge)
             return -1.0 if context and text == "实时" else -5.0
 
     engine = Engine(tmp_path / "personal", BrokenModel())
-    with MailboxService(bridge.directory, engine) as service:
+    with MailboxService(bridge.directory, engine, debounce_interval=0) as service:
         service.poll_once()
         composition_after(bridge, "系统支持")
         bridge.filter()

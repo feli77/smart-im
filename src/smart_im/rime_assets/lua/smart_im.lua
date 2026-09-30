@@ -57,6 +57,10 @@ local function online(state)
 end
 
 local function invalidate(state)
+  -- Cancel queued work as soon as its composition is no longer applicable.
+  -- An in-flight worker also checks this file before publishing its response.
+  os.remove(state.directory .. "/" .. state.id .. ".request")
+  os.remove(state.directory .. "/" .. state.id .. ".response")
   state.revision = state.revision + 1
   state.snapshot, state.approved, state.sent, state.sent_at = nil, nil, nil, nil
   state.unavailable, state.retry = nil, nil
@@ -65,6 +69,25 @@ end
 local function reset_history(state)
   state.history, state.last_commit = "", nil
   invalidate(state)
+end
+
+local function context_before(state, context, start)
+  if start == 0 then return state.history end
+  local text, position = state.history, 0
+  -- Selected segments remain inside the composition until the whole phrase is
+  -- committed. Read only segments before the candidate range: looking up the
+  -- active menu here would recursively invoke this filter.
+  for _, segment in ipairs(context.composition:toSegmentation():get_segments()) do
+    if segment.start >= start then break end
+    if segment.start ~= position or segment._end <= position or segment._end > start
+        or (segment.status ~= "kSelected" and segment.status ~= "kConfirmed") then return "" end
+    local candidate = segment:get_selected_candidate()
+    if not candidate or candidate.start ~= segment.start or candidate._end ~= segment._end
+        or candidate.text == "" or not bounded(candidate.text, MAX_TEXT) then return "" end
+    text, position = tail(text .. candidate.text, MAX_CONTEXT), segment._end
+  end
+  -- Do not splice committed history across an unknown piece of composition.
+  return position == start and text or ""
 end
 
 local function synchronize(state, context)
@@ -80,7 +103,7 @@ local function synchronize(state, context)
   state.ai, state.learning, state.app = ai, learning, app
   local snapshot = state.snapshot
   if snapshot and (snapshot.input ~= context.input or snapshot.caret ~= context.caret_pos
-      or snapshot.context ~= state.history) then invalidate(state) end
+      or snapshot.context ~= context_before(state, context, snapshot.start)) then invalidate(state) end
 end
 
 local function prompt(context, message)
@@ -163,7 +186,8 @@ local function snapshot_of(state, context, candidates)
   if type(start) ~= "number" or type(finish) ~= "number" or start < 0
       or finish <= start or finish > #context.input then return nil, nil, UNAVAILABLE end
   local pinyin = context.input:sub(start + 1, finish)
-  local parts = { hex(context.input), tostring(context.caret_pos), hex(state.history),
+  local preceding = context_before(state, context, start)
+  local parts = { hex(context.input), tostring(context.caret_pos), hex(preceding),
     state.learning and "1" or "0" }
   local eligible, slots = {}, {}
   for index, candidate in ipairs(candidates) do
@@ -184,7 +208,7 @@ local function snapshot_of(state, context, candidates)
   end
   if #eligible < 2 then return nil, nil, UNNEEDED end
   return { fingerprint = table.concat(parts, "|"), input = context.input,
-    caret = context.caret_pos, pinyin = pinyin, context = state.history,
+    caret = context.caret_pos, start = start, pinyin = pinyin, context = preceding,
     count = #eligible, slots = slots }, eligible
 end
 
@@ -323,9 +347,17 @@ local function processor(key, env)
     prompt(context, request_prompt(state))
     return 1
   end
+  local message = "Tab：AI排序"
+  if state.snapshot.context == "" and not state.learning then
+    local unchanged = true
+    for index, value in ipairs(order) do
+      if index ~= value then unchanged = false; break end
+    end
+    if unchanged then message = "缺少上下文，保留原候选" end
+  end
   state.approved = { fingerprint = state.snapshot.fingerprint, order = order }
   context:refresh_non_confirmed_composition()
-  prompt(context, "Tab：AI排序")
+  prompt(context, message)
   return 1
 end
 

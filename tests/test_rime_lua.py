@@ -44,7 +44,7 @@ class LuaHarness:
                 input = 'shishi', caret_pos = 6, refreshes = 0, commit_text = '',
                 options = { smart_im_ai = true, smart_im_learning = false, ascii_mode = false },
                 properties = {}, commit_notifier = notifier(), option_update_notifier = notifier(),
-                unhandled_key_notifier = notifier(), segment = { prompt = '' },
+                unhandled_key_notifier = notifier(), segment = { prompt = '' }, segments = {},
               }
               function ctx:get_option(name) return self.options[name] or false end
               function ctx:set_option(name, value)
@@ -62,6 +62,9 @@ class LuaHarness:
               ctx.composition = {}
               function ctx.composition:empty() return ctx.input == '' end
               function ctx.composition:back() return ctx.segment end
+              function ctx.composition:toSegmentation()
+                return { get_segments = function() return ctx.segments end }
+              end
               return ctx
             end
             function make_key(code, flags)
@@ -75,6 +78,12 @@ class LuaHarness:
               return { text = text, start = start or 0, _end = finish or 6,
                 type = 'phrase', comment = 'comment' .. index, preedit = 'shi shi',
                 quality = 10 - index, identity = index, genuine = {} }
+            end
+            function selected_segment(text, start, finish, status)
+              local seg = { start = start, _end = finish, status = status,
+                candidate = candidate(text, 1, start, finish) }
+              function seg:get_selected_candidate() return self.candidate end
+              return seg
             end
             function collect(module, env, candidates)
               local input = { index = 0, reads = 0 }
@@ -127,6 +136,11 @@ class LuaHarness:
                 self.lua.globals().candidate(text, i, start, finish)
                 for i, text in enumerate(texts, 1)
             ]
+        )
+
+    def set_segments(self, *segments):
+        self.context.segments = self.lua.table_from(
+            [self.lua.globals().selected_segment(*segment) for segment in segments]
         )
 
     def filter(self, candidates=None):
@@ -252,6 +266,14 @@ def test_pending_tab_consumes_only_plain_tab_and_keeps_originals(bridge):
     assert identities(bridge.filter()) == [1, 2, 3]
 
 
+def test_identity_result_without_context_does_not_claim_ai_ranking(bridge):
+    bridge.filter()
+    bridge.response("1,2,3")
+    bridge.press()
+    assert identities(bridge.filter()) == [1, 2, 3]
+    assert bridge.context.segment.prompt == "缺少上下文，保留原候选"
+
+
 @pytest.mark.parametrize("change", ["input", "caret", "candidate", "metadata", "learning"])
 def test_approved_order_is_invalidated_by_changed_snapshot(bridge, change):
     bridge.filter()
@@ -374,6 +396,97 @@ def test_request_pinyin_uses_the_candidates_shared_segment(bridge):
     assert parse_rank_request(bridge.request_path.read_bytes()).pinyin == "shishi"
 
 
+@pytest.mark.parametrize("status", ["kSelected", "kConfirmed"])
+@pytest.mark.parametrize(
+    "prefix,spelling,pinyin,texts",
+    [
+        ("铁血", "tiexue", "zhanshi", ["展示", "战士"]),
+        ("解决", "jiejue", "fangan", ["反感", "方案"]),
+    ],
+)
+def test_selected_uncommitted_prefix_is_sent_as_context(
+    bridge, status, prefix, spelling, pinyin, texts
+):
+    bridge.option("smart_im_learning", True)
+    bridge.context.input = spelling + pinyin
+    bridge.context.caret_pos = len(bridge.context.input)
+    bridge.set_segments((prefix, 0, len(spelling), status))
+    bridge.filter(bridge.make_candidates(texts, start=len(spelling), finish=len(spelling + pinyin)))
+    request = parse_rank_request(bridge.request_path.read_bytes())
+    assert request.pinyin == pinyin
+    assert request.context == prefix
+    assert request.candidates == tuple(texts)
+    assert not list(bridge.directory.glob("*.commit"))
+    assert bridge.processor_env.smart_im_state.history == ""
+
+
+def test_prefix_combines_multiple_selected_segments_and_committed_history(bridge):
+    bridge.commit("我们", "women")
+    bridge.context.input = "jihuaquanshishishi"
+    bridge.context.caret_pos = len(bridge.context.input)
+    bridge.set_segments(("计划", 0, 5, "kConfirmed"), ("全市", 5, 11, "kSelected"))
+    bridge.filter(bridge.make_candidates(["实施", "实时"], start=11, finish=17))
+    assert parse_rank_request(bridge.request_path.read_bytes()).context == "我们计划全市"
+
+
+def test_active_candidate_is_never_read_or_included_in_its_own_context(bridge):
+    bridge.context.input = "tiexuezhanshi"
+    bridge.context.caret_pos = 13
+    bridge.set_segments(("铁血", 0, 6, "kSelected"), ("展示", 6, 13, "kGuess"))
+    bridge.context.segments[2].get_selected_candidate = bridge.lua.eval(
+        "function() error('active menu recursively requested') end"
+    )
+    bridge.filter(bridge.make_candidates(["展示", "战士"], start=6, finish=13))
+    assert parse_rank_request(bridge.request_path.read_bytes()).context == "铁血"
+    bridge.response("2,1")
+    bridge.press()
+    assert identities(bridge.filter()) == [2, 1]
+
+
+@pytest.mark.parametrize("change", ["text", "status", "range"])
+def test_changed_selected_prefix_invalidates_ready_result_before_tab(bridge, change):
+    bridge.context.input = "tiexuezhanshi"
+    bridge.context.caret_pos = 13
+    bridge.set_segments(("铁血", 0, 6, "kSelected"))
+    bridge.filter(bridge.make_candidates(["展示", "战士"], start=6, finish=13))
+    previous = parse_rank_request(bridge.request_path.read_bytes()).revision
+    bridge.response("2,1")
+    segment = bridge.context.segments[1]
+    if change == "text":
+        segment.candidate.text = "贴血"
+    elif change == "status":
+        segment.status = "kGuess"
+    else:
+        segment._end = 5
+    bridge.enable_refresh()
+    bridge.press()
+    assert identities(bridge.filter()) == [1, 2]
+    request = parse_rank_request(bridge.request_path.read_bytes())
+    assert request.revision > previous
+    assert request.context == ("贴血" if change == "text" else "")
+    bridge.response("2,1")
+    bridge.press()
+    assert identities(bridge.filter()) == [2, 1]
+
+
+def test_selected_prefix_remains_bounded_and_is_not_duplicated_after_commit(bridge):
+    bridge.commit("你" * 64)
+    bridge.commit("😀" * 64)
+    bridge.context.input = "tiexuezhanshi"
+    bridge.context.caret_pos = 13
+    bridge.set_segments(("铁血", 0, 6, "kConfirmed"))
+    bridge.filter(bridge.make_candidates(["展示", "战士"], start=6, finish=13))
+    request = parse_rank_request(bridge.request_path.read_bytes())
+    assert request.context == "你" * 62 + "😀" * 64 + "铁血"
+    bridge.commit("铁血战士", "tiexuezhanshi")
+    bridge.set_segments()
+    bridge.context.input = "shishi"
+    bridge.context.caret_pos = 6
+    bridge.filter(bridge.make_candidates(["事实", "实时"]))
+    request = parse_rank_request(bridge.request_path.read_bytes())
+    assert request.context == "你" * 60 + "😀" * 64 + "铁血战士"
+
+
 def test_service_started_after_existing_menu_is_requested_on_tab(tmp_path):
     bridge = LuaHarness(tmp_path, heartbeat=False)
     bridge.filter()
@@ -419,6 +532,27 @@ def test_repeated_pending_tab_does_not_invalidate_an_inflight_request(bridge):
     bridge.response()
     bridge.press()
     assert identities(bridge.filter()) == [2, 1, 3]
+
+
+@pytest.mark.parametrize("action", ["commit", "escape", "ai_off"])
+def test_invalidation_removes_only_own_rank_mailbox_files(bridge, action):
+    bridge.option("smart_im_learning", True)
+    bridge.filter()
+    bridge.response()
+    other_request = bridge.directory / "other-session.request"
+    other_response = bridge.directory / "other-session.response"
+    for path in [other_request, other_response]:
+        path.write_text("other session")
+    if action == "commit":
+        bridge.commit("事实")
+        assert len(list(bridge.directory.glob("*.commit"))) == 1
+    elif action == "escape":
+        bridge.press(0xFF1B)
+    else:
+        bridge.option("smart_im_ai", False)
+    assert not bridge.request_path.exists()
+    assert not bridge.response_path.exists()
+    assert other_request.read_text() == other_response.read_text() == "other session"
 
 
 def test_ai_off_disables_requests_tab_interception_and_learning(bridge):

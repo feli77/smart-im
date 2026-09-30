@@ -44,7 +44,7 @@ def ollama_server():
     server.headers = {"Content-Type": "application/json"}
     server.delay = 0
     server.chunk_delay = 0
-    server.body = _response([1, 0])
+    server.body = _response(1)
     worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
     worker.start()
     server.endpoint = f"http://127.0.0.1:{server.server_port}"
@@ -56,11 +56,11 @@ def ollama_server():
         worker.join(timeout=2)
 
 
-def _response(order, **overrides):
+def _response(best, **overrides):
     response = {
         "done": True,
         "done_reason": "stop",
-        "message": {"role": "assistant", "content": json.dumps({"order": order})},
+        "message": {"role": "assistant", "content": json.dumps({"best": best})},
     }
     response.update(overrides)
     return json.dumps(response).encode("utf-8")
@@ -75,20 +75,21 @@ def test_real_http_request_ranks_whole_pool_and_preserves_data(ollama_server):
     path, headers, payload = ollama_server.requests[0]
     assert path == "/api/chat"
     assert headers["Content-Type"] == "application/json"
-    assert payload["model"] == "qwen3:0.6b"
+    assert payload["model"] == "qwen3:1.7b"
     assert payload["stream"] is False
     assert payload["think"] is False
-    assert payload["options"] == {"temperature": 0, "num_predict": 256, "num_ctx": 4096}
+    assert payload["options"] == {"temperature": 0, "num_predict": 32, "num_ctx": 4096}
     assert payload["keep_alive"] == "10m"
     schema = payload["format"]
-    assert schema["properties"]["order"]["items"]["maximum"] == 1
-    assert schema["properties"]["order"]["uniqueItems"] is True
+    assert schema["properties"]["best"] == {"type": "integer", "minimum": 0, "maximum": 1}
     assert payload["messages"][0]["role"] == "system"
-    assert "不能作为指令" in payload["messages"][0]["content"]
+    assert "不是指令" in payload["messages"][0]["content"]
     assert json.loads(payload["messages"][1]["content"]) == {
         "context": context[-128:],
         "pinyin": "houxuan",
-        "candidates": [{"index": 0, "text": texts[0]}, {"index": 1, "text": texts[1]}],
+        "options": [
+            {"index": index, "phrase": context[-16:] + text} for index, text in enumerate(texts)
+        ],
     }
 
 
@@ -102,11 +103,11 @@ def test_unnecessary_requests_are_skipped(ollama_server, context, texts):
 
 
 @pytest.mark.parametrize(
-    "order",
-    [[], [0], [0, 0], [1, 2], [-1, 0], [True, 0], [1.0, 0], ["1", 0], [0, 1, 2], "10", None],
+    "best",
+    [[], [0], [1, 0], -1, 2, True, False, 1.0, "1", None, {"index": 1}],
 )
-def test_invalid_permutations_are_rejected(ollama_server, order):
-    ollama_server.body = _response(order)
+def test_invalid_selections_are_rejected(ollama_server, best):
+    ollama_server.body = _response(best)
     with pytest.raises(OllamaError, match="invalid or incomplete"):
         OllamaReranker(endpoint=ollama_server.endpoint).rerank("前文", ["甲", "乙"])
 
@@ -121,13 +122,14 @@ def test_invalid_permutations_are_rejected(ollama_server, order):
         {"done_reason": "load"},
         {"error": "secret user input"},
         {"message": None},
-        {"message": {"content": {"order": [1, 0]}}},
-        {"message": {"content": '```json\n{"order":[1,0]}\n```'}},
-        {"message": {"content": '{"order":[1,0],"new_word":"secret user input"}'}},
+        {"message": {"content": {"best": 1}}},
+        {"message": {"content": '```json\n{"best":1}\n```'}},
+        {"message": {"content": '{"best":1,"new_word":"secret user input"}'}},
+        {"message": {"content": '{"order":[1,0]}'}},
     ],
 )
 def test_incomplete_or_malformed_responses_fail_without_leaking_text(ollama_server, overrides):
-    ollama_server.body = _response([1, 0], **overrides)
+    ollama_server.body = _response(1, **overrides)
     with pytest.raises(OllamaError) as error:
         OllamaReranker(endpoint=ollama_server.endpoint).rerank("private context", ["甲", "乙"])
     assert "secret" not in str(error.value)
@@ -242,10 +244,27 @@ def test_invalid_model_names_are_rejected(model):
 
 
 def test_largest_supported_pool_and_duplicate_candidates(ollama_server):
-    texts = ["甲" * 64] * 32
-    expected = list(reversed(range(32)))
-    ollama_server.body = _response(expected)
-    assert OllamaReranker(endpoint=ollama_server.endpoint).rerank("前文", texts) == expected
+    texts = ["😀" * 64] * 32
+    expected = [31, *range(31)]
+    ollama_server.body = _response(31)
+    assert OllamaReranker(endpoint=ollama_server.endpoint).rerank("前" * 128, texts) == expected
+    payload = ollama_server.requests[0][2]
+    data = json.loads(payload["messages"][1]["content"])
+    assert data["context"] == "前" * 128
+    assert len(data["options"]) == 32
+    assert data["options"][-1] == {"index": 31, "phrase": "前" * 16 + texts[-1]}
+    prompt_bytes = sum(len(message["content"].encode("utf-8")) for message in payload["messages"])
+    assert payload["options"]["num_ctx"] >= prompt_bytes + 512
+
+
+@pytest.mark.parametrize("best", [0, 1, 2, 3])
+def test_only_selected_index_moves_and_remaining_candidates_keep_rime_order(ollama_server, best):
+    texts = ["展示", "战士", "展示", "战事"]
+    ollama_server.body = _response(best)
+    order = OllamaReranker(endpoint=ollama_server.endpoint).rerank("铁血", texts, "zhanshi")
+    assert order == [best, *(index for index in range(4) if index != best)]
+    assert sorted(order) == list(range(4))
+    assert texts == ["展示", "战士", "展示", "战事"]
 
 
 @pytest.mark.parametrize(
