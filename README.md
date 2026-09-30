@@ -1,12 +1,12 @@
 # 灵序 Smart IM
 
-**Rime / 小狼毫 + 本地 AI 候选重排**。Rime 负责拼音、基础候选和上屏，Python 服务复用自带的小模型和 SQLite 个人统计。依赖安装后离线运行，不使用云端大模型。
+**Rime / 小狼毫的本地候选重排服务。** Rime 提供拼音、基础候选和上屏，Smart IM 使用自带的小模型与可选 SQLite 个人统计调整候选顺序。依赖安装后离线运行。
 
-这一版是最小可用接入：正常输入先显示 Rime 原始候选，后台算好后按 **Tab** 应用 AI 排序，再用空格或数字选词。服务关闭、结果过期或计算失败时保持原候选。没有自动刷新候选或突然改序。
+正常输入先显示 Rime 原始候选，按 **Tab** 应用后台已完成的排序，再用空格或数字选词。服务关闭、结果过期或计算失败时保持原候选。
 
 ## Windows 使用
 
-先安装支持 `librime-lua` 的[小狼毫](https://github.com/rime/weasel)，并确保已有 `luna_pinyin` 词典/方案。项目不捆绑或修改小狼毫。
+需要 Python 3.10+、支持现代 `librime-lua` 的[小狼毫](https://github.com/rime/weasel)，以及已能正常使用的 `luna_pinyin` 词典与 OpenCC 简体转换配置。
 
 ```powershell
 py -3 -m venv .venv
@@ -14,64 +14,57 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m smart_im install-rime
 ```
 
-在小狼毫“输入法设定”中勾选 **Smart IM**，然后重新部署并切换到该方案。安装命令只写本项目的 schema 和 Lua 文件，不改现有 `default.custom.yaml` 或 `rime.lua`。
+在小狼毫“输入法设定”中勾选 **Smart IM**，重新部署并切换到该方案，然后运行：
 
 ```powershell
 .\.venv\Scripts\python.exe -m smart_im serve
 ```
 
-保持终端运行。先输入并确认“我们计划”，再输入 `shishi`，稍等片刻按 Tab，可观察“实施”的排序。没有前文时保留基础顺序是正常行为。结果未就绪时提示稍后再按 Tab，不阻塞打字。Ctrl+C 关闭服务后仍可正常使用基础输入。
+保持终端运行。先输入并确认“我们计划”，再输入 `shishi`，稍等后按 Tab，观察“实施”的排序。没有上下文且未启用学习时保留原序。结果未就绪时会提示稍后再按 Tab。Ctrl+C 退出服务。
 
-完整步骤、依赖、学习开关和人工验收见 [Rime 使用说明](docs/RIME.md)。
+安装命令只写 `smart_im.schema.yaml` 和 `lua/smart_im.lua`，不修改现有方案。完整步骤见 [Rime 使用说明](docs/RIME.md)。
 
-## 架构与范围
+## 功能与数据
 
-```mermaid
-flowchart LR
-    A[Windows 应用] <--> W[小狼毫 / TSF]
-    W <--> R[Rime 拼音与候选]
-    R <--> L[Smart IM Lua 适配]
-    L <-->|异步本地文件信箱| S[Python AI 服务]
-    S --> M[本地小模型]
-    S <--> P[(SQLite 个人统计)]
+- 只重排前 9 个范围一致的候选，保留 Rime Candidate 对象和元数据。
+- Lua 与 Python 通过有界的本地文件信箱通信；输入过程不等待模型完成。
+- 上下文来自当前 Rime 会话的有限确认文本，不读取应用正文；同一应用内的控件切换仍需真机验证。
+- 个人学习默认关闭。服务使用 `--learn` 且方案切换为“学习开启”时，才读取和写入个人统计。
+- 专用方案关闭 Rime 用户词典学习，由 SQLite 保存确认词句及最多 8 字的上下文后缀。个人数据和临时信箱均为本地明文。
+- 自带字符 MLP 与 n-gram 使用有限语料，排序收益仍需独立质量评估。
+
+## 命令
+
+| 命令 | 用途 |
+|---|---|
+| `install-rime` | 安装独立方案与 Lua 适配；支持 `--user-dir` 和 `--force` |
+| `serve` | 运行信箱服务；支持 `--user-dir` 或 `--runtime-dir` |
+| `rerank` | 对指定候选重排，输出零基索引排列 |
+| `stats` | 查看已有个人统计的数量 |
+| `reset --yes` | 清空个人学习数据；先停止服务 |
+
+```powershell
+.\.venv\Scripts\python.exe -m smart_im rerank 实时 事实 实施 --pinyin shishi --context 我们计划
+.\.venv\Scripts\python.exe -m smart_im --learn serve
+.\.venv\Scripts\python.exe -m smart_im stats
 ```
 
-- 只重排最多 9 个范围一致的原始候选，保留 Rime Candidate 对象及其元数据，不用模型替代拼音解码。
-- 使用 Lua/Python 标准库文件信箱，无额外 Lua 网络依赖，无 HTTP 服务，也不在按键路径启动 Python 进程或等待模型。
-- 学习默认关闭：服务 `--learn` 和方案“学习开启”都开启时才使用与写入个人统计。专用方案关闭 Rime 用户词典，避免两套学习重复计数。
-- 上下文只来自当前 Rime 会话中本工具观察到的有限确认文本，不读取外部应用正文。会话不等于应用控件，焦点隔离还有限制。
-- 自带 27,484 参数字符 MLP + n-gram 是有限语料基线；Rime 改善输入底座，不会自动提升模型语言能力。
+全局选项 `--data-dir` 指定个人数据目录，`--learn` 开启个人统计读写。`rerank --private` 可对单次请求禁用个人统计。
 
-本版不包含无拼音续写、文内灰字、外部文档语义改写、自动异步刷新、C++ 插件或 Personal LM 训练。已有预测与纠错继续保留在桌面体验台/CLI。当前开发环境为 Linux，Windows 小狼毫真机验收仍需执行。
-
-## CLI 与演示工具
+## 开发与验证
 
 ```sh
-# 验证外部候选排序；输出原候选的零基索引排列
-smart-im rerank 实时 事实 实施 --pinyin shishi --context 我们计划
-# 自定义 Rime 目录（Linux 需显式指定所用前端的用户目录）
-smart-im install-rime --user-dir /path/to/rime
-smart-im serve --user-dir /path/to/rime
-# 旧版独立桌面体验台，需要额外安装桌面依赖
-python -m pip install -e ".[desktop]"
-smart-im desktop
-```
-
-`suggest`、`predict`、`correct` 和旧的 `windows` 钩子浮窗仍可用于演示与回归测试，日常 Windows 输入主线是 Rime。桌面预览见 [截图](docs/desktop-preview.png)，旧浮窗说明见 [历史 Windows MVP](docs/WINDOWS.md)。
-
-## 文档与验证
-
-- [本次最小重构计划](docs/REFACTOR_PLAN.md)
-- [当前架构](docs/ARCHITECTURE.md)
-- [模型说明与可选 GGUF](docs/MODEL_CARD.md)
-- [验证记录](docs/VALIDATION.md)
-
-```sh
-uv sync --extra dev --extra desktop
+uv sync --extra dev
 uv run pytest -q
 uv run ruff check .
 uv run ruff format --check .
 uv build
 ```
 
-测试包含真实 Lua 运行时与 Python 服务的协议整合，Qt 使用 offscreen。它们不等价于 Windows TSF 真机验收。本项目的 schema、Lua 适配、自带演示词典及模型资源都包含在 wheel 内；第三方 `luna_pinyin` 需另行安装。运行 Rime 服务不需要安装 PySide6。
+测试包含真实 Lua 运行时、文件信箱和 Python 服务，Rime 对象由测试模拟。Windows 小狼毫实际部署与上屏尚未验收。
+
+项目的 schema、Lua、语料及模型权重包含在 wheel 中；第三方 `luna_pinyin` 词典需另行安装。
+
+- [当前架构](docs/ARCHITECTURE.md)
+- [模型说明](docs/MODEL_CARD.md)
+- [验证记录](docs/VALIDATION.md)

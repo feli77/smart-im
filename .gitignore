@@ -7,7 +7,6 @@ __pycache__/
 build/
 dist/
 *.sqlite3*
-*.gguf
 .coverage
 artifacts/
 smart_im_runtime/

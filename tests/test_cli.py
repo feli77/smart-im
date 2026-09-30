@@ -1,14 +1,42 @@
 import json
-import sys
 
 import pytest
 
-from smart_im.cli import main
+from smart_im.cli import main, parser
+from smart_im.engine import Engine
 
 
-def test_cli_suggest(tmp_path, capsys):
-    assert main(["--data-dir", str(tmp_path), "suggest", "nihao"]) == 0
-    assert json.loads(capsys.readouterr().out)["candidates"][0]["text"] == "你好"
+def test_cli_rerank_uses_bundled_model(tmp_path, capsys):
+    assert (
+        main(
+            [
+                "--data-dir",
+                str(tmp_path),
+                "rerank",
+                "实时",
+                "事实",
+                "实施",
+                "--context",
+                "我们计划",
+                "--pinyin",
+                "shishi",
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result == {"order": [2, 0, 1], "candidates": ["实施", "实时", "事实"]}
+    assert not (tmp_path / "learning.sqlite3").exists()
+
+
+def test_cli_stats_and_reset_existing_learning(tmp_path, capsys):
+    with Engine(tmp_path, learning=True) as engine:
+        engine.commit_external("shishi", "实施", "执行")
+    assert main(["--data-dir", str(tmp_path), "stats"]) == 0
+    assert json.loads(capsys.readouterr().out)["selections"] == 1
+    assert main(["--data-dir", str(tmp_path), "reset", "--yes"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["selections"] == result["phrases"] == result["contexts"] == 0
 
 
 def test_cli_requires_explicit_reset_confirmation(tmp_path):
@@ -17,9 +45,25 @@ def test_cli_requires_explicit_reset_confirmation(tmp_path):
     assert exc.value.code == 2
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="non-Windows platform guard")
-def test_windows_has_actionable_platform_error(capsys):
+@pytest.mark.parametrize(
+    "command",
+    [
+        "suggest",
+        "predict",
+        "correct",
+        "commit",
+        "desktop",
+        "windows",
+        "benchmark",
+    ],
+)
+def test_removed_commands_are_rejected(command):
     with pytest.raises(SystemExit) as exc:
-        main(["windows"])
+        parser().parse_args([command])
     assert exc.value.code == 2
-    assert "需要 Windows" in capsys.readouterr().err
+
+
+def test_removed_model_option_is_rejected():
+    with pytest.raises(SystemExit) as exc:
+        parser().parse_args(["--model", "model.gguf", "stats"])
+    assert exc.value.code == 2

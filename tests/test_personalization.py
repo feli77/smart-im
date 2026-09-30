@@ -13,8 +13,7 @@ def test_frequency_survives_reopen_and_pinyin_normalizes(tmp_path):
         assert store.frequency("xian", "西安") == 2
     with PersonalStore(path) as store:
         assert store.frequency("XI AN", "西安") == 2
-        assert store.candidates("xian")[0].text == "西安"
-        assert store.predict("我准备去")[0].text == "西安"
+        assert store.context_counts("我准备去") == {"西安": 2}
         assert store.stats() == {"phrases": 1, "selections": 2, "contexts": 1}
     if os.name != "nt":
         assert path.stat().st_mode & 0o777 == 0o600
@@ -39,7 +38,7 @@ def test_clear_removes_all_learning_and_file_contents(tmp_path):
         store.record("mimi", "这是保密的测试短语", "保密上下文")
         store.clear()
         assert store.stats() == {"phrases": 0, "selections": 0, "contexts": 0}
-        assert store.predict("保密上下文") == []
+        assert store.context_counts("保密上下文") == {}
         assert store.frequency("mimi", "这是保密的测试短语") == 0
     assert "这是保密的测试短语".encode("utf-8") not in path.read_bytes()
 
@@ -49,17 +48,16 @@ def test_concurrent_commits_are_not_lost():
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(lambda _: store.record("nihao", "你好", "大家"), range(100)))
         assert store.frequency("nihao", "你好") == 100
-        assert store.predict("大家")[0].frequency == 100
+        assert store.context_counts("大家") == {"你好": 100}
 
 
 def test_literal_sql_characters_and_limits():
     with PersonalStore(":memory:") as store:
         store.record("x", "hello'", "abc_%")
         store.record("x", "other", "xyz12")
-        assert store.predict("other_%")[0].text == "hello'"
-        assert store.candidates("x", 0) == []
-        assert store.predict("abc_%", 0) == []
-        assert store.predict("") == []
+        assert store.context_counts("other_%") == {"hello'": 1}
+        assert store.context_counts("abc_%", 0) == {}
+        assert store.context_counts("") == {}
         assert store.frequency("x' OR 1=1 --", "other") == 0
 
 
@@ -72,3 +70,38 @@ def test_store_evicts_old_entries():
         assert store.stats()["contexts"] == 3
         assert store.frequency("x0", "测试0") == 0
         assert store.frequency("x4", "测试4") == 1
+
+
+def test_context_counts_prefer_exact_context_and_aggregate_suffix_fallback():
+    with PersonalStore(":memory:") as store:
+        store.record("shishi", "实施", "我们计划")
+        store.record("shishi", "实施", "他们计划")
+        store.record("taolun", "讨论", "他们计划")
+        assert store.context_counts("我们计划") == {"实施": 1}
+        assert store.context_counts("新的计划") == {"实施": 2, "讨论": 1}
+        assert store.context_counts("新的计划", 1) == {"实施": 2}
+        assert store.context_counts("划") == {}
+
+
+def test_context_counts_rank_by_frequency_then_recency(monkeypatch):
+    with PersonalStore(":memory:") as store:
+        monkeypatch.setattr("smart_im.personalization.time.time", lambda: 1.0)
+        store.record("a", "常用", "相同上下文")
+        store.record("a", "常用", "相同上下文")
+        store.record("b", "旧选词", "相同上下文")
+        monkeypatch.setattr("smart_im.personalization.time.time", lambda: 2.0)
+        store.record("c", "新选词", "相同上下文")
+        assert list(store.context_counts("相同上下文").items()) == [
+            ("常用", 2),
+            ("新选词", 1),
+            ("旧选词", 1),
+        ]
+
+
+def test_context_counts_cap_results_at_one_hundred():
+    with PersonalStore(":memory:") as store:
+        for index in range(101):
+            store.record(f"x{index}", f"测试{index}", "相同上下文")
+        assert len(store.context_counts("相同上下文")) == 100
+        assert len(store.context_counts("相同上下文", 1000)) == 100
+        assert len(store.context_counts("新上下文", 1000)) == 100

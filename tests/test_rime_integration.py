@@ -17,9 +17,6 @@ class FlatModel:
     def score(self, context, text):
         return -3.0
 
-    def predict(self, context, limit=5):
-        raise AssertionError("External candidates must not trigger generation")
-
 
 @pytest.fixture
 def bridge(tmp_path, monkeypatch):
@@ -59,7 +56,6 @@ def test_bundled_model_round_trip_only_changes_display_after_tab(tmp_path, bridg
         assert sorted(identities(output)) == [1, 2, 3]
         assert bridge.lua.eval("rawequal")(output[0], originals[2])
         assert originals[2].comment == "comment2"
-        assert engine._decoder is None
         assert not (engine.data_dir / "learning.sqlite3").exists()
 
 

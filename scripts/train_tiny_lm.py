@@ -1,6 +1,6 @@
 """Rebuild the bundled character MLP from the authored offline corpus.
 
-Run: OPENBLAS_NUM_THREADS=1 .venv/bin/python scripts/train_tiny_lm.py
+Run: uv run python scripts/train_tiny_lm.py
 No third-party training data, torch, network, or model download is needed.
 The corpus is deliberately tiny: this is a working inference baseline, not a
 general-purpose pretrained Chinese model. Fixed seed, Adam, 4-char context.

@@ -14,7 +14,7 @@ def external_pinyin_key(raw: str) -> str:
 
     Accept letters, tone marks/numbers and common syllable separators. Invalid
     spellings are not learned; candidate text itself is always retained exactly.
-    This also supports Rime abbreviations and words absent from our demo lexicon.
+    This also supports Rime abbreviations without maintaining a separate lexicon.
     """
     if not isinstance(raw, str) or len(raw) > 96:
         return ""

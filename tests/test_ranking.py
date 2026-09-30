@@ -12,34 +12,19 @@ class ContextModel:
     def score(self, context, text):
         return -1.0 if (context, text) in {("执行", "实施"), ("这是", "事实")} else -5.0
 
-    def predict(self, context, limit=5):
-        raise AssertionError("External ranking must never generate candidates")
-
 
 class FlatModel(ContextModel):
     def score(self, context, text):
         return -3.0
 
 
-def test_external_rank_uses_context_without_constructing_decoder(tmp_path, monkeypatch):
-    def no_decoder():
-        raise AssertionError("External candidates must not load the demo decoder")
-
-    monkeypatch.setattr("smart_im.engine.PinyinDecoder", no_decoder)
+def test_external_rank_uses_context_and_explicit_learning(tmp_path):
     with Engine(tmp_path, ContextModel(), learning=True) as engine:
         texts = ["事实", "实时", "实施"]
         assert engine.rerank(texts, "执行", "shishi") == [2, 0, 1]
         assert engine.rerank(texts, "这是", "shishi") == [0, 1, 2]
         engine.commit_external("ss", "实施")
         assert engine.rerank(texts, pinyin="ss")[0] == 2
-        assert engine._decoder is None
-
-
-def test_decoder_remains_available_lazily_for_legacy_api(tmp_path):
-    with Engine(tmp_path, FlatModel()) as engine:
-        assert engine._decoder is None
-        assert engine.suggest("nihao").candidates[0].text == "你好"
-        assert engine._decoder is not None
 
 
 def test_duplicates_remain_distinct_indices_and_input_is_unchanged(tmp_path):

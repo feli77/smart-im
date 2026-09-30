@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("serve", "install-rime", "desktop", "windows")]
+    [ValidateSet("serve", "install-rime")]
     [string]$Mode = "serve",
     [switch]$Learn
 )
@@ -11,15 +11,9 @@ if (-not (Test-Path $projectPython)) {
     py -3 -m venv .venv
     if ($LASTEXITCODE -ne 0) { throw "请先安装 Python 3.10 或更新版本。" }
 }
-$packageSpec = "."
-$importCheck = "import smart_im"
-if ($Mode -in @("desktop", "windows")) {
-    $packageSpec = ".[desktop]"
-    $importCheck = "import smart_im, PySide6"
-}
-& $projectPython -c $importCheck 2>$null
+& $projectPython -c "import smart_im, numpy" 2>$null
 if ($LASTEXITCODE -ne 0) {
-    & $projectPython -m pip install -e $packageSpec
+    & $projectPython -m pip install -e .
     if ($LASTEXITCODE -ne 0) { throw "依赖安装失败。请检查终端输出。" }
 }
 $launchArgs = @("-m", "smart_im")

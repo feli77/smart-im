@@ -1,61 +1,59 @@
-# Smart IM 架构（Rime MVP）
+# Smart IM 架构
 
-## 当前主线
-
-小狼毫提供 Windows TSF、原生组合输入、候选窗口与上屏；librime 和已有 `luna_pinyin` 词典提供基础中文输入。Smart IM 只增强候选排序与个人统计，不 fork 输入法前端。
+小狼毫提供 Windows TSF、组合输入、候选窗口与上屏；Rime 和 `luna_pinyin` 提供基础候选。Smart IM 负责候选重排和可选个人统计。
 
 ```mermaid
 flowchart LR
-    K[按键] --> R[Rime 基础候选]
-    R --> UI[小狼毫原始候选]
-    R --> Q[Lua 写入最新请求]
-    Q --> F[本地文件信箱]
+    R[Rime 基础候选] --> UI[小狼毫候选窗口]
+    R --> L[Lua 候选快照]
+    L --> F[本地文件信箱]
     F --> S[Python 服务]
-    S --> E[Engine.rerank]
-    E --> M[本地模型上下文增益]
-    E --> P[(可选 SQLite 个人统计)]
+    S --> M[本地模型评分]
+    S <--> P[(SQLite 个人统计)]
     S --> F
-    F --> T[Tab 校验并应用索引排列]
+    F --> T[Tab 校验并应用排列]
     T --> UI
-    UI --> C[用户确认上屏]
-    C -->|显式开启学习| F
+    UI --> C[确认上屏]
+    C -->|学习开启| F
 ```
 
-## 职责
+## 模块职责
 
-| 文件/模块 | 职责 |
+| 模块 | 职责 |
 |---|---|
-| `rime_assets/smart_im.schema.yaml` | 独立 Rime 拼音方案；复用词典；关闭 Rime 用户词典 |
-| `rime_assets/lua/smart_im.lua` | 候选快照、后台请求、Tab 重排、确认事件；保留原候选对象 |
-| `rime_protocol.py` | 有大小限制的版本化消息与索引排列 |
-| `rime_service.py` | 本地信箱轮询、单实例锁、心跳、异常回退、事件消费与清理 |
-| `rime_install.py` | 安装两个本项目资源；冲突预检和备份；不改其他方案 |
-| `ranking.py` | 保留原始顺序的先验 + 有界模型上下文增益 + 可选个人证据 |
-| `engine.py` | 外部 `rerank` / `commit_external`，以及保留的旧演示 API |
-| `models.py` / `personalization.py` | 复用本地模型与 SQLite，不重新设计模型系统 |
-| `decoder.py` / `session.py` / `desktop.py` / `windows.py` | 原有独立演示、测试与回归基线，不进入 Rime 主输入链路 |
+| `rime_assets/smart_im.schema.yaml` | 独立方案、词典引用和学习开关 |
+| `rime_assets/lua/smart_im.lua` | 候选快照、请求提交、Tab 重排和确认事件 |
+| `rime_protocol.py` | 有界消息解析和索引排列校验 |
+| `rime_service.py` | 信箱轮询、单实例锁、心跳、异常回退及文件清理 |
+| `rime_install.py` | 两个项目资源的安装、冲突预检和备份 |
+| `engine.py` | 外部候选排序、确认学习、统计查询与清空 |
+| `ranking.py` | 原始顺序先验、模型上下文增益和个人统计加分 |
+| `models.py` | 自带字符模型与 n-gram 评分 |
+| `personalization.py` | 有界 SQLite 词频和短上下文统计 |
+| `cli.py` | `install-rime`、`serve`、`rerank`、`stats`、`reset` |
 
-## 本版的关键取舍
+## 候选与交互
 
-**显式 Tab 重排。** Rime 插件执行与前端刷新有同步生命周期约束。为避免修改小狼毫或新增 C++ 桥接，本版不主动从后台刷新候选。每次候选变化提交新的后台请求；只有 Tab 才应用匹配版本的结果，普通空格或数字保持当前显示顺序。
+Lua 只缓冲前 9 个范围一致的候选，并保留原始 Candidate 对象。快照包含输入、光标位置、会话上下文、学习状态和候选元数据。输入或快照变化使旧结果失效。
 
-**文件信箱。** Lua 标准库即可访问，安装后只需一个 Python 进程。I/O 在按键路径仅处理有界小文件；推理在独立进程。它不是零延迟通道，默认服务轮询约 20 ms，磁盘和杀毒软件可能增加开销。未来需要自动刷新时再更换 IPC/前端事件机制。
+服务返回候选索引排列。后台完成不会改变正在显示的顺序；Tab 校验会话、版本和排列后才应用结果。普通空格和数字继续使用当前显示顺序。无服务、错误结果和过期结果都保留基础候选。
 
-**返回索引，不重造候选。** Rime 候选包含范围和来源信息。服务只返回索引排列；Lua 保留原对象，并且只允许同一范围的有限候选参与排序。异常、过期、不合法排列均保留原序。
+`Engine.rerank(texts, context, pinyin, private)` 返回零基排列，保留重复候选。评分结合 Rime 顺序先验、模型相对空上下文的有限增益及可选个人统计。无上下文且无个人证据时保持原序；模型失败时整批回退。
 
-**本版统一由 SQLite 学习。** 专用 schema 设置 `translator/enable_user_dict: false`；AI 服务与方案开关必须同时开启才使用或保存个人统计。未来需要 Rime 自带词频学习时，应重新划分统计职责，不能直接重复叠加。
+## 本地信箱
 
-**上下文只是有限会话历史。** 不承诺获得 Word、浏览器等应用正文，也不把 Rime 会话当作可靠的编辑控件边界。导航/模式切换等可观察事件会失效上下文，但同一应用内鼠标移动等仍可能无法检测。此局限与 Windows 人工验收一起公开。
+Lua 和 Python 通过标准库读写用户目录下的 `smart_im_runtime`，不在输入路径启动进程或等待模型。默认轮询间隔为 20 ms，文件系统和进程调度会增加响应时间。
 
-## 扩展边界
+消息上限为 16 KiB，最多 9 个候选；拼音、上下文和单个候选分别限制为 96、128、64 个字符。文本使用 UTF-8 十六进制编码，服务校验文件名、会话、版本和字段边界。编码只用于分隔消息，不提供加密。
 
-`Engine.rerank(texts, context, pinyin, private)` 接受外部候选并返回零基排列；`commit_external` 只在确认后记录。`LanguageModel` 接口仍可替换本地模型或 Personal LM。独立程序的 `suggest/predict/correct` 保留，但本版 Rime 不接入生成式续写或全文纠错。
+每个会话的新排序请求覆盖旧请求；服务完成推理后再次检查请求是否变化。确认事件使用独立文件，成功处理后在内存去重。协议文件 30 秒过期，正常退出清理本服务的临时文件。学习事件不提供跨进程重启的恰好一次交付保证。
 
-当前不添加服务注册/自动启动、插件管理框架、远程 API、模型下载器或训练平台。
+服务持有目录级单实例锁并更新心跳。Lua 在心跳过期时回退基础候选。文件重命名竞争、异常退出及真实输入延迟仍需在小狼毫环境验收。
 
-## 官方参考
+## 学习与上下文
 
-- [librime 架构与源码](https://github.com/rime/librime)
-- [小狼毫 Windows 前端](https://github.com/rime/weasel)
-- [librime-lua 脚本接口](https://github.com/hchunhui/librime-lua/wiki/Scripting)
-- [librime-lua 对象接口](https://github.com/hchunhui/librime-lua/wiki/Objects)
+服务 `--learn` 与方案“学习开启”必须同时启用，才读取或保存个人统计；仅确认上屏触发记录。专用 schema 设置 `translator/enable_user_dict: false`，个人学习统一由 SQLite 管理。
+
+会话历史最多保留 128 字，持久统计只使用最多 8 字的上下文后缀。模式切换、可观察的导航操作、应用属性变化和超时会清空历史。同一应用内的鼠标移动或控件切换不一定可见，因此会话历史不能代表实际编辑位置周围的文本。
+
+安装只管理本项目两个资源；词典部署、方案切换和服务启动由用户完成。接口与安装方式见 [Rime 使用说明](RIME.md)，验证范围见 [验证记录](VALIDATION.md)。

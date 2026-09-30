@@ -13,8 +13,6 @@ import threading
 import time
 from pathlib import Path
 
-from smart_im.types import Candidate
-
 
 class PersonalStore:
     MAX_CONTEXT = 8
@@ -86,7 +84,7 @@ class PersonalStore:
                 """,
                     (self._context(context), text, now, self.MAX_COUNT),
                 )
-            # Bound storage even for a long-running desktop process. Evict the
+            # Bound storage even for a long-running service. Evict the
             # least recently used entries, retaining recent changes of style.
             for table in ("words", "transitions"):
                 self._db.execute(
@@ -105,25 +103,10 @@ class PersonalStore:
             ).fetchone()
         return int(row[0]) if row else 0
 
-    def candidates(self, pinyin: str, limit: int = 20) -> list[Candidate]:
-        if limit <= 0:
-            return []
-        with self._lock:
-            rows = self._db.execute(
-                """
-                SELECT text, count FROM words WHERE pinyin=?
-                ORDER BY count DESC, last_used DESC, text LIMIT ?
-            """,
-                (self._key(pinyin), min(limit, 100)),
-            ).fetchall()
-        return [
-            Candidate(text, self._key(pinyin), count, "personal", annotation="个人词频")
-            for text, count in rows
-        ]
-
-    def predict(self, context: str, limit: int = 5) -> list[Candidate]:
+    def context_counts(self, context: str, limit: int = 100) -> dict[str, int]:
+        """Return phrase counts for a bounded context, with two-character fallback."""
         if not context or limit <= 0:
-            return []
+            return {}
         suffix = self._context(context)
         with self._lock:
             rows = self._db.execute(
@@ -145,16 +128,7 @@ class PersonalStore:
                 """,
                     (short, min(limit, 100)),
                 ).fetchall()
-        return [
-            Candidate(
-                text=text,
-                frequency=count,
-                source="personal",
-                score=float(count),
-                annotation="个人表达习惯",
-            )
-            for text, count in rows
-        ]
+        return {text: int(count) for text, count in rows}
 
     def stats(self) -> dict[str, int]:
         with self._lock:
