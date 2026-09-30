@@ -2,6 +2,11 @@
 
 Generated from Git history with git-cliff. Changes without a version tag appear under Unreleased.
 
+## [0.2.1] - 2026-09-30
+
+### Bug Fixes
+
+- **rime:** Improve contextual candidate selection and reduce stale inference
 ## [0.2.0] - 2026-09-30
 
 ### Bug Fixes

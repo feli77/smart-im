@@ -2,7 +2,7 @@
 schema:
   schema_id: smart_im
   name: Smart IM · 灵序拼音
-  version: "0.2.0"
+  version: "0.2.1"
   description: |
     本地 AI 候选排序。先显示原候选，按 Tab 应用已完成的排序。
     需要 luna_pinyin 词典、librime-lua 和独立运行的 Smart IM 服务。
