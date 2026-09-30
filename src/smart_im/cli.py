@@ -75,7 +75,12 @@ def main(argv: list[str] | None = None) -> int:
                 from .rime_service import MailboxService
 
                 location = args.runtime_dir or runtime_dir(args.user_dir)
-                service = MailboxService(location, engine)
+                refresh = None
+                if sys.platform == "win32":
+                    from .rime_refresh import WindowsCandidateRefresh
+
+                    refresh = WindowsCandidateRefresh()
+                service = MailboxService(location, engine, refresh=refresh)
                 print(
                     f"Smart IM 服务已启动：{location}；模型：{engine.model.name}；Ctrl+C 退出。",
                     file=sys.stderr,

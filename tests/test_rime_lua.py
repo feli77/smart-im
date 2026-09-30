@@ -44,7 +44,8 @@ class LuaHarness:
                 input = 'shishi', caret_pos = 6, refreshes = 0, commit_text = '',
                 options = { smart_im_ai = true, smart_im_learning = false, ascii_mode = false },
                 properties = {}, commit_notifier = notifier(), option_update_notifier = notifier(),
-                unhandled_key_notifier = notifier(), segment = { prompt = '' }, segments = {},
+                update_notifier = notifier(), unhandled_key_notifier = notifier(),
+                segment = { prompt = '', selected_index = 0 }, segments = {},
               }
               function ctx:get_option(name) return self.options[name] or false end
               function ctx:set_option(name, value)
@@ -57,7 +58,10 @@ class LuaHarness:
               function ctx:has_menu() return self.input ~= '' end
               function ctx:refresh_non_confirmed_composition()
                 self.refreshes = self.refreshes + 1
+                self.segment.selected_index = 0
+                self.segment.prompt = ''
                 if self.refresh_callback then self.refresh_callback() end
+                self.update_notifier:emit(self)
               end
               ctx.composition = {}
               function ctx.composition:empty() return ctx.input == '' end
@@ -112,6 +116,8 @@ class LuaHarness:
         self.module.processor.init(self.processor_env)
         self.module.filter.init(self.filter_env)
         self.candidates = self.make_candidates(["事实", "实时", "实施"])
+        self.displayed = []
+        self.enable_refresh()
         if heartbeat:
             self.heartbeat()
 
@@ -149,9 +155,10 @@ class LuaHarness:
         output, self.first_yield_reads = self.lua.globals().collect(
             self.module, self.filter_env, self.candidates
         )
-        return list(output.values())
+        self.displayed = list(output.values())
+        return self.displayed
 
-    def press(self, code=0xFF09, **flags):
+    def press(self, code=0xFF60, **flags):
         key = self.lua.globals().make_key(code, self.lua.table_from(flags))
         return self.module.processor.func(key, self.processor_env)
 
@@ -168,6 +175,11 @@ class LuaHarness:
 
     def option(self, name, value):
         self.context.set_option(self.context, name, value)
+
+    def update(self, **fields):
+        for name, value in fields.items():
+            setattr(self.context, name, value)
+        self.context.update_notifier.emit(self.context.update_notifier, self.context)
 
     def commit(self, text, pinyin="shishi"):
         self.context.input = pinyin
@@ -206,18 +218,162 @@ def test_no_live_service_preserves_candidates_and_creates_no_requests(tmp_path, 
     bridge.close()
 
 
-def test_typing_and_selection_never_automatically_apply_ready_result(bridge):
+def test_selection_keys_do_not_change_the_display_before_select_notification(bridge):
     assert identities(bridge.filter()) == [1, 2, 3]
     bridge.response()
     assert bridge.press(0x20) == 2
     assert bridge.press(ord("2")) == 2
-    assert identities(bridge.filter()) == [1, 2, 3]
+    assert identities(bridge.displayed) == [1, 2, 3]
+    assert bridge.context.refreshes == 0
     assert bridge.press() == 1
-    assert identities(bridge.filter()) == [2, 1, 3]
+    assert identities(bridge.displayed) == [2, 1, 3]
+    assert bridge.context.segment.selected_index == 0
+    assert bridge.context.segment.prompt == "★ AI 推荐"
+    assert bridge.press(release=True) == 1
+    assert bridge.context.refreshes == 1
     assert not list(bridge.directory.glob("*.commit"))
 
 
-def test_tab_keeps_original_candidate_objects_duplicates_and_metadata(bridge):
+def test_natural_filter_automatically_applies_ready_result(bridge):
+    bridge.filter()
+    bridge.response()
+    assert identities(bridge.filter()) == [2, 1, 3]
+    assert bridge.context.segment.prompt == "★ AI 推荐"
+    assert bridge.context.refreshes == 0
+
+
+def test_ready_notification_keeps_a_menu_the_user_has_already_navigated(bridge):
+    bridge.filter()
+    bridge.context.segment.selected_index = 1
+    bridge.update()
+    request = bridge.request_path.read_bytes()
+    bridge.response()
+    assert bridge.press() == 1
+    assert bridge.press(release=True) == 1
+    assert identities(bridge.displayed) == [1, 2, 3]
+    assert bridge.context.segment.selected_index == 1
+    assert bridge.context.refreshes == 0
+    assert bridge.processor_env.smart_im_state.approved is None
+    assert bridge.request_path.read_bytes() == request
+    assert not list(bridge.directory.glob("*.commit"))
+
+
+def test_repeated_ready_notifications_do_not_reset_user_highlight(bridge):
+    bridge.filter()
+    bridge.response()
+    bridge.press()
+    bridge.context.segment.selected_index = 2
+    request = bridge.request_path.read_bytes()
+    for _ in range(3):
+        assert bridge.press() == 1
+        assert bridge.press(release=True) == 1
+    assert bridge.context.refreshes == 1
+    assert bridge.context.segment.selected_index == 2
+    assert bridge.request_path.read_bytes() == request
+    assert not list(bridge.directory.glob("*.commit"))
+
+
+@pytest.mark.parametrize("navigation", [False, True])
+def test_moving_highlight_clears_recommendation_without_rebuilding_or_learning(bridge, navigation):
+    bridge.filter()
+    bridge.response()
+    bridge.press()
+    assert bridge.context.segment.prompt == "★ AI 推荐"
+    refreshes = bridge.context.refreshes
+    request = bridge.request_path.read_bytes()
+    if navigation:
+        assert bridge.press(0xFF54) == 2
+    bridge.context.segment.selected_index = 1
+    bridge.update()
+    assert bridge.context.segment.prompt == ""
+    assert bridge.context.segment.selected_index == 1
+    assert bridge.context.refreshes == refreshes
+    assert identities(bridge.displayed) == [2, 1, 3]
+    if navigation:
+        assert not bridge.request_path.exists()
+        assert bridge.processor_env.smart_im_state.approved is None
+    else:
+        assert bridge.request_path.read_bytes() == request
+    assert not list(bridge.directory.glob("*.commit"))
+
+
+def test_unchanged_update_keeps_recommendation_until_ranking_is_invalidated(bridge):
+    bridge.filter()
+    bridge.response()
+    bridge.press()
+    request = bridge.request_path.read_bytes()
+    bridge.update()
+    assert bridge.context.segment.prompt == "★ AI 推荐"
+    assert bridge.context.segment.selected_index == 0
+    assert bridge.context.refreshes == 1
+    assert bridge.request_path.read_bytes() == request
+    # A navigation key may invalidate ranking even if the index stays at zero.
+    bridge.press(0xFF52)
+    bridge.update()
+    assert bridge.context.segment.prompt == ""
+    assert bridge.context.segment.selected_index == 0
+    assert bridge.context.refreshes == 1
+    assert not bridge.request_path.exists()
+    assert not list(bridge.directory.glob("*.commit"))
+
+
+@pytest.mark.parametrize("change", ["candidate", "metadata", "unranked_slot"])
+def test_notification_rechecks_the_actual_base_candidates_before_applying(bridge, change):
+    if change == "unranked_slot":
+        bridge.candidates[2]._end = 3
+    bridge.filter()
+    previous = parse_rank_request(bridge.request_path.read_bytes()).revision
+    bridge.response("2,1" if change == "unranked_slot" else "2,1,3")
+    if change == "candidate":
+        bridge.candidates[1].text = "时时"
+    elif change == "metadata":
+        bridge.candidates[1].comment = "changed"
+    else:
+        bridge.candidates[2].comment = "changed partial"
+    bridge.press()
+    assert identities(bridge.displayed) == [1, 2, 3]
+    assert bridge.context.segment.prompt == "AI计算中"
+    assert parse_rank_request(bridge.request_path.read_bytes()).revision > previous
+    assert not bridge.response_path.exists()
+
+
+@pytest.mark.parametrize("change", ["input", "caret", "clear"])
+def test_update_notifier_cancels_requests_before_any_more_keys_arrive(bridge, change):
+    bridge.filter()
+    bridge.response()
+    response = bridge.response_path.read_bytes()
+    if change == "input":
+        bridge.update(input="shishia", caret_pos=7)
+    elif change == "caret":
+        bridge.update(caret_pos=5)
+    else:
+        bridge.update(input="", caret_pos=0)
+    assert not bridge.request_path.exists()
+    assert not bridge.response_path.exists()
+    # A late worker may still publish after its last file check. It cannot
+    # revive a canceled composition or cause a refresh/commit.
+    bridge.response_path.write_bytes(response)
+    assert bridge.press() == 1
+    assert bridge.press(release=True) == 1
+    assert bridge.context.refreshes == 0
+    assert not bridge.request_path.exists()
+    assert not list(bridge.directory.glob("*.commit"))
+
+
+@pytest.mark.parametrize("flags", [{"ctrl": True}, {"alt": True}, {"super": True}])
+def test_refresh_signal_with_modifiers_does_not_clear_history_or_commit(bridge, flags):
+    bridge.commit("我们计划", "womenjihua")
+    bridge.context.input, bridge.context.caret_pos = "shishi", 6
+    bridge.filter()
+    bridge.response()
+    assert bridge.press(**flags) == 1
+    assert bridge.press(release=True, **flags) == 1
+    assert identities(bridge.displayed) == [2, 1, 3]
+    assert bridge.processor_env.smart_im_state.history == "我们计划"
+    assert not list(bridge.directory.glob("*.commit"))
+
+
+def test_refresh_keeps_original_candidate_objects_duplicates_and_metadata(bridge):
     bridge.filter(bridge.make_candidates(["事实", "事实", "实时"]))
     bridge.response()
     bridge.press()
@@ -257,12 +413,64 @@ def test_other_session_old_revision_or_model_fallback_never_reorders(bridge, kin
     assert identities(bridge.filter()) == [1, 2, 3]
 
 
-def test_pending_tab_consumes_only_plain_tab_and_keeps_originals(bridge):
+def test_fallback_stays_visible_without_an_automatic_retry_loop(bridge):
     bridge.filter()
-    assert bridge.press(shift=True) == 2
-    assert bridge.press(release=True) == 2
+    request = bridge.request_path.read_bytes()
+    bridge.response(status="fallback")
+    for _ in range(3):
+        bridge.press()
+        assert identities(bridge.filter()) == [1, 2, 3]
+        assert bridge.context.segment.prompt == "AI暂不可用，保留原候选"
+    assert bridge.context.refreshes == 0
+    assert bridge.request_path.read_bytes() == request
+    assert not list(bridge.directory.glob("*.commit"))
+
+
+@pytest.mark.parametrize("flags", [{}, {"shift": True}, {"release": True}])
+def test_tab_passes_through_without_applying_results_or_clearing_context(bridge, flags):
+    bridge.commit("我们计划", "womenjihua")
+    bridge.context.input, bridge.context.caret_pos = "shishi", 6
+    bridge.filter()
+    bridge.response()
+    refreshes = bridge.context.refreshes
+    assert bridge.press(0xFF09, **flags) == 2
+    key = bridge.lua.globals().make_key(0xFF09, bridge.lua.table_from(flags))
+    notifier = bridge.context.unhandled_key_notifier
+    notifier.emit(notifier, bridge.context, key)
+    assert identities(bridge.displayed) == [1, 2, 3]
+    assert bridge.context.refreshes == refreshes
+    assert bridge.processor_env.smart_im_state.history == "我们计划"
+
+
+@pytest.mark.parametrize("flags", [{"ctrl": True}, {"alt": True}, {"super": True}])
+@pytest.mark.parametrize("unhandled", [False, True])
+def test_tab_shortcuts_pass_through_and_reset_context(bridge, flags, unhandled):
+    bridge.commit("我们计划", "womenjihua")
+    bridge.context.input, bridge.context.caret_pos = "shishi", 6
+    bridge.filter()
+    bridge.response()
+    refreshes = bridge.context.refreshes
+    if unhandled:
+        key = bridge.lua.globals().make_key(0xFF09, bridge.lua.table_from(flags))
+        notifier = bridge.context.unhandled_key_notifier
+        notifier.emit(notifier, bridge.context, key)
+    else:
+        assert bridge.press(0xFF09, **flags) == 2
+        assert bridge.press(0xFF09, release=True, **flags) == 2
+    assert identities(bridge.displayed) == [1, 2, 3]
+    assert bridge.context.refreshes == refreshes
+    assert bridge.processor_env.smart_im_state.history == ""
+    assert not bridge.request_path.exists()
+    assert not bridge.response_path.exists()
+
+
+def test_pending_notification_keeps_originals_without_rebuilding(bridge):
+    bridge.filter()
+    assert bridge.press(shift=True) == 1
+    assert bridge.press(release=True) == 1
     assert bridge.press() == 1
-    assert bridge.context.segment.prompt == "AI计算中，请稍后再按Tab"
+    assert bridge.context.segment.prompt == "AI计算中"
+    assert bridge.context.refreshes == 0
     assert identities(bridge.filter()) == [1, 2, 3]
 
 
@@ -274,8 +482,18 @@ def test_identity_result_without_context_does_not_claim_ai_ranking(bridge):
     assert bridge.context.segment.prompt == "缺少上下文，保留原候选"
 
 
+def test_identity_result_with_context_can_recommend_the_existing_first_candidate(bridge):
+    bridge.commit("我们计划", "womenjihua")
+    bridge.context.input, bridge.context.caret_pos = "shishi", 6
+    bridge.filter()
+    bridge.response("1,2,3")
+    bridge.press()
+    assert identities(bridge.displayed) == [1, 2, 3]
+    assert bridge.context.segment.prompt == "★ AI 推荐"
+
+
 @pytest.mark.parametrize("change", ["input", "caret", "candidate", "metadata", "learning"])
-def test_approved_order_is_invalidated_by_changed_snapshot(bridge, change):
+def test_applied_order_is_invalidated_by_changed_snapshot(bridge, change):
     bridge.filter()
     bridge.response()
     bridge.press()
@@ -348,7 +566,7 @@ def test_one_eligible_candidate_never_claims_to_be_computing(bridge, mixed):
         assert not bridge.request_path.exists()
 
 
-def test_request_write_failure_is_visible_and_tab_can_retry(bridge):
+def test_request_write_failure_retries_only_on_a_natural_filter(bridge):
     bridge.lua.execute(
         """
         original_open = io.open
@@ -366,6 +584,8 @@ def test_request_write_failure_is_visible_and_tab_can_retry(bridge):
     assert not bridge.request_path.exists()
     bridge.lua.execute("io.open = original_open")
     bridge.press()
+    assert not bridge.request_path.exists()
+    bridge.filter()
     assert bridge.request_path.exists()
     assert "计算中" in bridge.context.segment.prompt
     bridge.response()
@@ -444,7 +664,7 @@ def test_active_candidate_is_never_read_or_included_in_its_own_context(bridge):
 
 
 @pytest.mark.parametrize("change", ["text", "status", "range"])
-def test_changed_selected_prefix_invalidates_ready_result_before_tab(bridge, change):
+def test_changed_selected_prefix_invalidates_ready_result_before_notification(bridge, change):
     bridge.context.input = "tiexuezhanshi"
     bridge.context.caret_pos = 13
     bridge.set_segments(("铁血", 0, 6, "kSelected"))
@@ -487,19 +707,20 @@ def test_selected_prefix_remains_bounded_and_is_not_duplicated_after_commit(brid
     assert request.context == "你" * 60 + "😀" * 64 + "铁血战士"
 
 
-def test_service_started_after_existing_menu_is_requested_on_tab(tmp_path):
+def test_service_started_after_existing_menu_is_requested_on_next_filter(tmp_path):
     bridge = LuaHarness(tmp_path, heartbeat=False)
     bridge.filter()
     assert not bridge.request_path.exists()
     bridge.heartbeat()
     assert bridge.press() == 1
-    assert bridge.context.refreshes == 1
+    assert bridge.context.refreshes == 0
+    assert not bridge.request_path.exists()
     assert identities(bridge.filter()) == [1, 2, 3]
     assert bridge.request_path.exists()
     bridge.close()
 
 
-def test_tab_reissues_an_unchanged_composition_after_mailbox_cleanup(bridge):
+def test_filter_reissues_an_unchanged_composition_after_mailbox_cleanup(bridge):
     bridge.filter()
     previous = parse_rank_request(bridge.request_path.read_bytes()).revision
     bridge.response()
@@ -521,7 +742,7 @@ def test_tab_reissues_an_unchanged_composition_after_mailbox_cleanup(bridge):
     assert identities(bridge.filter()) == [2, 1, 3]
 
 
-def test_repeated_pending_tab_does_not_invalidate_an_inflight_request(bridge):
+def test_repeated_pending_notification_does_not_invalidate_an_inflight_request(bridge):
     bridge.filter()
     request = bridge.request_path.read_bytes()
     for _ in range(3):
@@ -555,11 +776,13 @@ def test_invalidation_removes_only_own_rank_mailbox_files(bridge, action):
     assert other_request.read_text() == other_response.read_text() == "other session"
 
 
-def test_ai_off_disables_requests_tab_interception_and_learning(bridge):
+def test_ai_off_disables_requests_and_learning_but_consumes_notifications(bridge):
     bridge.option("smart_im_learning", True)
     bridge.option("smart_im_ai", False)
     assert identities(bridge.filter()) == [1, 2, 3]
-    assert bridge.press() == 2
+    assert bridge.press() == 1
+    assert bridge.press(release=True) == 1
+    assert bridge.press(0xFF09) == 2
     bridge.commit("事实")
     assert not bridge.request_path.exists()
     assert not list(bridge.directory.glob("*.commit"))
@@ -648,7 +871,14 @@ def test_component_cleanup_disconnects_notifiers_only_after_last_reference(bridg
     bridge.commit("实施")
     assert len(list(bridge.directory.glob("*.commit"))) == 1
     assert all(
-        not connection.active for connection in bridge.context.commit_notifier.connections.values()
+        not connection.active
+        for notifier in [
+            bridge.context.commit_notifier,
+            bridge.context.update_notifier,
+            bridge.context.option_update_notifier,
+            bridge.context.unhandled_key_notifier,
+        ]
+        for connection in notifier.connections.values()
     )
 
 

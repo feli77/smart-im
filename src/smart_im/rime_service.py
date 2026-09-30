@@ -1,4 +1,4 @@
-"""Local mailbox worker; no input hooks or per-key subprocesses."""
+"""Local mailbox worker with an optional foreground candidate refresh signal."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .engine import Engine
 from .rime_protocol import (
@@ -19,6 +20,9 @@ from .rime_protocol import (
     render_response,
     valid_permutation,
 )
+
+if TYPE_CHECKING:
+    from .rime_refresh import RefreshTarget, WindowsCandidateRefresh
 
 _REQUEST = re.compile(rf"({SESSION_PATTERN})\.request")
 _RESPONSE = re.compile(rf"({SESSION_PATTERN})\.response")
@@ -47,6 +51,8 @@ class MailboxService:
         engine: Engine,
         poll_interval: float = 0.02,
         debounce_interval: float = 0.08,
+        *,
+        refresh: WindowsCandidateRefresh | None = None,
     ) -> None:
         if not 0.001 <= poll_interval <= 1.0:
             raise ValueError("poll_interval must be between 0.001 and 1 second")
@@ -57,13 +63,14 @@ class MailboxService:
         self.engine = engine
         self.poll_interval = poll_interval
         self.debounce_interval = debounce_interval
+        self.refresh = refresh
         self._closed = False
         self._heartbeat_at = float("-inf")
         self._heartbeat_lock = threading.Lock()
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._processed: OrderedDict[str, bytes] = OrderedDict()
-        self._pending: OrderedDict[str, tuple[bytes, float]] = OrderedDict()
+        self._pending: OrderedDict[str, tuple[bytes, float, RefreshTarget | None]] = OrderedDict()
         self._committed: OrderedDict[tuple[str, int], None] = OrderedDict()
         self._lock_file = (self.runtime_dir / "service.lock").open("a+b")
         try:
@@ -174,17 +181,27 @@ class MailboxService:
         except ValueError:
             self._remember(self._processed, path.name, data, MAX_SESSIONS)
             return False
-        if self.debounce_interval:
-            now = time.monotonic()
-            pending = self._pending.get(path.name)
-            if pending is None or pending[0] != data:
-                pending = (data, now)
-                self._remember(self._pending, path.name, pending, MAX_SESSIONS)
-            if now - pending[1] < self.debounce_interval:
-                # Coalesce intermediate spellings before starting slow inference.
-                # Do not let an older session occupy the model during this wait.
-                # Commits and heartbeats still run on every poll.
-                return True
+        now = time.monotonic()
+        pending = self._pending.get(path.name)
+        if pending is None or pending[0] != data:
+            target = self.refresh.capture() if self.refresh else None
+            pending = (data, now, target)
+            self._remember(self._pending, path.name, pending, MAX_SESSIONS)
+        if now - pending[1] < self.debounce_interval:
+            # Coalesce intermediate spellings before starting slow inference.
+            # Do not let an older session occupy the model during this wait.
+            # Commits and heartbeats still run on every poll.
+            return True
+        # Bind notification to the focus observed for this request. Allow the
+        # final typing key to be released during debounce before taking the
+        # last-input baseline; a focus change must never retarget the signal.
+        target = self.refresh.ready(pending[2]) if self.refresh else None
+        if pending[2] is not None and target is None:
+            # A long final keypress can outlast debounce. Keep its request
+            # pending until keys are released instead of computing a result
+            # that could never notify. Changed focus is never rebound here;
+            # a newer request takes priority and idle requests still expire.
+            return True
         fallback = False
         try:
             order = self.engine.rerank(
@@ -207,6 +224,10 @@ class MailboxService:
         if self._atomic_write(response, render_response(request, order, fallback=fallback)):
             self._remember(self._processed, path.name, data, MAX_SESSIONS)
             self._pending.pop(path.name, None)
+            # Publishing can race cancellation as well as inference. Lua also
+            # validates the session/revision/fingerprint before touching its menu.
+            if self.refresh and self._read(path) == data:
+                self.refresh.notify(target)
         return True
 
     def _commit(self, path: Path) -> bool:

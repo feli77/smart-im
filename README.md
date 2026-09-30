@@ -2,7 +2,7 @@
 
 **Rime / 小狼毫的本地候选重排服务。** Rime 提供拼音、基础候选和上屏，Smart IM 支持通过本机 Ollama 使用 Qwen 等开源模型，并结合可选 SQLite 个人统计调整候选顺序。自带 tiny 模型仅用于演示。
 
-正常输入先显示 Rime 原始候选，按 **Tab** 应用后台已完成的排序，再用空格或数字选词。服务关闭、结果过期或计算失败时保持原候选。
+正常输入先显示 Rime 原始候选；在 Windows 小狼毫中，模型返回后自动更新候选，推荐词移到首位并高亮，候选栏显示 **★ AI 推荐**，再用空格或数字选词。无需按 Tab。服务关闭、结果过期或计算失败时保持原候选。
 
 ## Windows 使用
 
@@ -20,7 +20,7 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m smart_im serve
 ```
 
-保持终端运行。先输入并确认“我们计划”，再输入 `shishi`，稍等后按 Tab，观察“实施”的排序。没有上下文且未启用学习时保留原序。结果未就绪时会提示稍后再按 Tab。Ctrl+C 退出服务。
+保持终端运行。先输入并确认“我们计划”，再输入 `shishi`，停下输入，观察“实施”自动移到首位并高亮。没有上下文且未启用学习时保留原序，也不标记为 AI 推荐。计算期间仍可按当前候选选词。Ctrl+C 退出服务。
 
 ## 使用本地 Qwen
 
@@ -51,6 +51,7 @@ Ollama 后端默认使用 `qwen3:1.7b`，也可显式指定 `qwen3:0.6b`。首�
 
 - 在前 9 项中只重排与首候选拼音范围一致的候选，其他范围固定原位，保留 Rime Candidate 对象和元数据。
 - Lua 与 Python 通过有界的本地文件信箱通信；输入过程不等待模型完成。
+- Windows 服务在结果写入后通知小狼毫刷新，刷新前检查前台窗口、焦点和输入状态；切换应用或继续操作后不唤醒旧窗口。其他前端在下次候选重建时读取已完成结果。
 - 上下文来自当前 Rime 会话的有限上屏文本及候选前已选的分段，不读取应用正文；同一应用内的控件切换仍需真机验证。
 - 个人学习默认关闭。服务使用 `--learn` 且方案切换为“学习开启”时，才读取和写入个人统计。
 - 专用方案关闭 Rime 用户词典学习，由 SQLite 保存确认词句及最多 8 字的上下文后缀。个人数据和临时信箱均为本地明文。
@@ -86,7 +87,7 @@ uv build
 
 开发依赖包含 git-cliff，版本由 `uv.lock` 固定。使用 `uv run git-cliff --config cliff.toml --output CHANGELOG.md` 从提交历史更新变更记录；没有版本标签的修改归入 `Unreleased`。协作、提交与发布流程见 [AGENTS.md](AGENTS.md)。
 
-测试包含真实 Lua 运行时、文件信箱、Python 服务及模拟 Ollama HTTP 接口，Rime 对象由测试模拟。另有 `uv run python scripts/evaluate_ollama.py --model qwen3:1.7b --repeat 2` 可复测本机模型；本次修复仍需更新 Lua、重新部署并重启服务后验收小狼毫完整链路。
+自动测试包含真实 Lua 运行时、文件信箱、Python 服务、模拟 Windows API 及 Ollama HTTP 接口。另已用本机 Rime DLL 的隔离会话验证原生刷新、高亮和取消行为，见 [验证记录](docs/VALIDATION.md)。`uv run python scripts/evaluate_ollama.py --model qwen3:1.7b --repeat 2` 可复测本机模型；更新 Lua、重新部署并重启服务后，仍需验收小狼毫完整输入链路。
 
 项目的 schema、Lua、语料及模型权重包含在 wheel 中；第三方 `luna_pinyin` 词典需另行安装。
 

@@ -1,4 +1,6 @@
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -129,3 +131,45 @@ def test_cli_rejects_remote_ollama_endpoint_before_sending_input(capsys):
         == 1
     )
     assert "local HTTP origin" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_cli_serve_enables_refresh_only_on_windows_without_learning(
+    tmp_path, capsys, monkeypatch, platform, interrupted
+):
+    calls = []
+    refresh = object()
+    runtime = tmp_path / "runtime"
+
+    def create_refresh():
+        calls.append("refresh")
+        return refresh
+
+    class FakeService:
+        def __init__(self, location, engine, *, refresh):
+            assert location == runtime
+            assert engine.learning is False
+            calls.append(("service", refresh))
+
+        def run(self):
+            calls.append("run")
+            if interrupted:
+                raise KeyboardInterrupt
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setitem(
+        sys.modules,
+        "smart_im.rime_refresh",
+        SimpleNamespace(WindowsCandidateRefresh=create_refresh),
+    )
+    monkeypatch.setattr("smart_im.rime_service.MailboxService", FakeService)
+    assert main(["--data-dir", str(tmp_path), "serve", "--runtime-dir", str(runtime)]) == 0
+    expected = ["refresh"] if platform == "win32" else []
+    expected.extend([("service", refresh if platform == "win32" else None), "run", "close"])
+    assert calls == expected
+    assert "服务已启动" in capsys.readouterr().err
+    assert not (tmp_path / "learning.sqlite3").exists()

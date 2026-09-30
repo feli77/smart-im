@@ -50,6 +50,28 @@ class FakeEngine:
         self.closed = True
 
 
+class FakeRefresh:
+    def __init__(self):
+        self.foreground = object()
+        self.ready_target = object()
+        self.captures = []
+        self.ready_calls = []
+        self.notifications = []
+        self.result = True
+
+    def capture(self):
+        self.captures.append(self.foreground)
+        return self.foreground
+
+    def ready(self, target):
+        self.ready_calls.append(target)
+        return self.ready_target if target is self.foreground else None
+
+    def notify(self, target):
+        self.notifications.append(target)
+        return self.result
+
+
 def test_protocol_round_trip_preserves_unicode_duplicates_and_context():
     request = parse_rank_request(message())
     assert request.session == "test-session"
@@ -169,7 +191,8 @@ def test_old_inference_cannot_overwrite_a_new_composition(tmp_path):
 
 
 def test_failed_atomic_response_is_retried(tmp_path, monkeypatch):
-    with MailboxService(tmp_path, FakeEngine(), debounce_interval=0) as service:
+    refresh = FakeRefresh()
+    with MailboxService(tmp_path, FakeEngine(), debounce_interval=0, refresh=refresh) as service:
         (tmp_path / "test-session.request").write_bytes(message())
         original = os.replace
 
@@ -182,9 +205,12 @@ def test_failed_atomic_response_is_retried(tmp_path, monkeypatch):
         service.poll_once()
         assert not (tmp_path / "test-session.response").exists()
         assert not list(tmp_path.glob(".smart-im-*.tmp"))
+        assert not refresh.notifications
         monkeypatch.setattr(os, "replace", original)
         service.poll_once()
         assert (tmp_path / "test-session.response").exists()
+        assert refresh.notifications == [refresh.ready_target]
+        assert len(refresh.captures) == 1
 
 
 def test_commit_deletion_failure_does_not_learn_twice(tmp_path, monkeypatch):
@@ -494,3 +520,192 @@ def test_debounce_does_not_delay_commits_or_heartbeat(tmp_path, monkeypatch):
 def test_debounce_interval_validation(tmp_path, debounce_interval):
     with pytest.raises(ValueError, match="debounce_interval"):
         MailboxService(tmp_path, FakeEngine(), debounce_interval=debounce_interval)
+
+
+def test_refresh_runs_once_only_after_atomic_response_is_available(tmp_path, monkeypatch):
+    engine = FakeEngine()
+    refresh = FakeRefresh()
+    response = tmp_path / "test-session.response"
+    with MailboxService(tmp_path, engine, debounce_interval=0, refresh=refresh) as service:
+        (tmp_path / "test-session.request").write_bytes(message())
+        rank = engine.rerank
+        write = service._atomic_write
+        notify = refresh.notify
+        stages = []
+
+        def observe_rank(*args, **kwargs):
+            assert not response.exists()
+            assert not refresh.notifications
+            stages.append("rank")
+            return rank(*args, **kwargs)
+
+        def observe_write(path, data):
+            if path == response:
+                assert not refresh.notifications
+                stages.append("publish")
+            return write(path, data)
+
+        def observe_notify(target):
+            assert response.read_text() == "SMARTIM1\tRESULT\ttest-session\t1\tok\n3,1,2\n"
+            stages.append("notify")
+            return notify(target)
+
+        monkeypatch.setattr(engine, "rerank", observe_rank)
+        monkeypatch.setattr(service, "_atomic_write", observe_write)
+        monkeypatch.setattr(refresh, "notify", observe_notify)
+        service.poll_once()
+        service.poll_once()
+        assert stages == ["rank", "publish", "notify"]
+        assert refresh.captures == [refresh.foreground]
+        assert refresh.ready_calls == [refresh.foreground]
+        assert refresh.notifications == [refresh.ready_target]
+        assert len(engine.ranks) == 1
+        assert engine.ranks[0][1]["private"] is True
+        assert not engine.commits
+
+
+@pytest.mark.parametrize("failure", ["invalid_order", "exception", "model_error"])
+def test_refresh_notifies_fallback_with_original_order(tmp_path, failure):
+    engine = FakeEngine(order=[0, 1, 2])
+    refresh = FakeRefresh()
+    if failure == "invalid_order":
+        engine.order = [0, 0, 0]
+    elif failure == "exception":
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("private typed content")
+
+        engine.rerank = fail
+    else:
+        engine.model_error = "unavailable"
+    with MailboxService(tmp_path, engine, debounce_interval=0, refresh=refresh) as service:
+        (tmp_path / "test-session.request").write_bytes(message())
+        service.poll_once()
+        assert (tmp_path / "test-session.response").read_text() == (
+            "SMARTIM1\tRESULT\ttest-session\t1\tfallback\n1,2,3\n"
+        )
+        assert refresh.notifications == [refresh.ready_target]
+
+
+@pytest.mark.parametrize("mutation", ["replace", "cancel"])
+@pytest.mark.parametrize("stage", ["inference", "publication"])
+def test_refresh_skips_requests_changed_during_inference_or_publication(
+    tmp_path, monkeypatch, mutation, stage
+):
+    engine = FakeEngine()
+    refresh = FakeRefresh()
+    request = tmp_path / "test-session.request"
+    response = tmp_path / "test-session.response"
+    with MailboxService(tmp_path, engine, debounce_interval=0, refresh=refresh) as service:
+        request.write_bytes(message())
+
+        def change_request():
+            if mutation == "replace":
+                request.write_bytes(message(sequence=2))
+            else:
+                request.unlink()
+
+        rank = engine.rerank
+        write = service._atomic_write
+
+        def change_during_rank(*args, **kwargs):
+            change_request()
+            return rank(*args, **kwargs)
+
+        def change_after_publish(path, data):
+            success = write(path, data)
+            if path == response:
+                assert success
+                change_request()
+            return success
+
+        if stage == "inference":
+            monkeypatch.setattr(engine, "rerank", change_during_rank)
+        else:
+            monkeypatch.setattr(service, "_atomic_write", change_after_publish)
+        service.poll_once()
+        assert not refresh.notifications
+        assert response.exists() is (stage == "publication")
+
+        monkeypatch.setattr(engine, "rerank", rank)
+        monkeypatch.setattr(service, "_atomic_write", write)
+        service.poll_once()
+        if mutation == "replace":
+            assert refresh.notifications == [refresh.ready_target]
+            assert "\t2\tok\n" in response.read_text()
+        else:
+            assert not refresh.notifications
+
+
+@pytest.mark.parametrize("focus_changed", [False, True])
+def test_refresh_debounce_preserves_original_foreground(tmp_path, monkeypatch, focus_changed):
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    refresh = FakeRefresh()
+    original_foreground = refresh.foreground
+    engine = FakeEngine()
+    with MailboxService(tmp_path, engine, refresh=refresh) as service:
+        (tmp_path / "test-session.request").write_bytes(message())
+        service.poll_once()
+        assert refresh.captures == [original_foreground]
+        assert not refresh.ready_calls
+        assert not engine.ranks
+        assert not refresh.notifications
+        if focus_changed:
+            refresh.foreground = object()
+        clock[0] += 0.04
+        service.poll_once()
+        assert not refresh.ready_calls
+        clock[0] += 0.05
+        service.poll_once()
+        assert len(engine.ranks) == (0 if focus_changed else 1)
+        assert refresh.captures == [original_foreground]
+        assert refresh.ready_calls == [original_foreground]
+        assert refresh.notifications == ([] if focus_changed else [refresh.ready_target])
+
+
+def test_refresh_waits_for_last_typing_key_to_release_before_inference(tmp_path, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    refresh = FakeRefresh()
+    released_target = refresh.ready_target
+    refresh.ready_target = None
+    engine = FakeEngine()
+    with MailboxService(tmp_path, engine, refresh=refresh) as service:
+        request = tmp_path / "test-session.request"
+        response = tmp_path / "test-session.response"
+        request.write_bytes(message())
+        service.poll_once()
+        clock[0] += 0.09  # Debounce elapsed, but the last character is still held.
+        service.poll_once()
+        assert not engine.ranks
+        assert not response.exists()
+        assert request.name in service._pending
+        assert request.name not in service._processed
+        assert not refresh.notifications
+
+        refresh.ready_target = released_target
+        clock[0] += 0.04
+        service.poll_once()
+        assert len(engine.ranks) == 1
+        assert response.read_text().endswith("ok\n3,1,2\n")
+        assert request.name not in service._pending
+        assert refresh.captures == [refresh.foreground]
+        assert refresh.ready_calls == [refresh.foreground, refresh.foreground]
+        assert refresh.notifications == [released_target]
+        service.poll_once()
+        assert len(engine.ranks) == 1
+        assert refresh.notifications == [released_target]
+
+
+def test_rejected_refresh_does_not_repeat_inference_or_notification(tmp_path):
+    engine = FakeEngine()
+    refresh = FakeRefresh()
+    refresh.result = False
+    with MailboxService(tmp_path, engine, debounce_interval=0, refresh=refresh) as service:
+        (tmp_path / "test-session.request").write_bytes(message())
+        service.poll_once()
+        service.poll_once()
+        assert len(engine.ranks) == 1
+        assert refresh.notifications == [refresh.ready_target]
+        assert (tmp_path / "test-session.response").read_text().endswith("ok\n3,1,2\n")

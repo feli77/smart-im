@@ -4,7 +4,7 @@ schema:
   name: Smart IM · 灵序拼音
   version: "0.2.1"
   description: |
-    本地 AI 候选排序。先显示原候选，按 Tab 应用已完成的排序。
+    本地 AI 候选排序。模型返回后自动更新候选并高亮推荐词。
     需要 luna_pinyin 词典、librime-lua 和独立运行的 Smart IM 服务。
   dependencies:
     - luna_pinyin
