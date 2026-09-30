@@ -2,6 +2,11 @@
 
 Generated from Git history with git-cliff. Changes without a version tag appear under Unreleased.
 
+## [0.3.0] - 2026-09-30
+
+### Features
+
+- **rime:** Automatically refresh and highlight AI recommendations
 ## [0.2.1] - 2026-09-30
 
 ### Bug Fixes
