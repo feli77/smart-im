@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "smart-im"
+version = "0.1.0"
+description = "Local-first Chinese predictive desktop input method"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26,<3", "pypinyin>=0.53,<1"]
+
+[project.optional-dependencies]
+desktop = ["PySide6>=6.8,<7"]
+gguf = ["llama-cpp-python>=0.3,<0.4"]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[project.scripts]
+smart-im = "smart_im.cli:main"
+smart-im-desktop = "smart_im.desktop:main"
+smart-im-windows = "smart_im.windows:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smart_im"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
