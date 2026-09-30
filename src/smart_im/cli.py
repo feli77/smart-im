@@ -23,18 +23,14 @@ def parser() -> argparse.ArgumentParser:
         "--user-dir", type=Path, help="Rime 用户目录；Windows 默认为 %%APPDATA%%/Rime"
     )
     install.add_argument("--force", action="store_true", help="备份已有不同内容后更新本项目文件")
-    serve = commands.add_parser("serve", help="运行 Rime 的本地 AI 后台服务")
+    serve = commands.add_parser("serve", help="运行 Rime 的本机 Ollama 重排服务")
     location = serve.add_mutually_exclusive_group()
     location.add_argument("--user-dir", type=Path, help="Rime 用户目录")
     location.add_argument("--runtime-dir", type=Path, help="直接指定信箱目录，用于测试或自定义部署")
     for command in (serve, rerank):
         command.add_argument(
-            "--backend",
-            choices=("tiny", "ollama"),
-            default="tiny",
-            help="tiny 为自带演示模型；ollama 使用本机开源模型",
+            "--model", default="qwen3:1.7b", help="Ollama 模型名称（默认 qwen3:1.7b）"
         )
-        command.add_argument("--model", default="qwen3:1.7b", help="Ollama 模型名称")
         command.add_argument(
             "--ollama-url", default="http://127.0.0.1:11434", help="本机 Ollama 地址"
         )
@@ -65,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         from .engine import Engine
 
         model = None
-        if getattr(args, "backend", "tiny") == "ollama":
+        if args.command in {"serve", "rerank"}:
             from .ollama_model import OllamaReranker
 
             model = OllamaReranker(args.model, args.ollama_url, args.model_timeout)

@@ -1,6 +1,6 @@
 # Smart IM 架构
 
-小狼毫提供 Windows TSF、组合输入、候选窗口与上屏；Rime 和 `luna_pinyin` 提供基础候选。Smart IM 负责候选重排和可选个人统计。
+小狼毫提供 Windows TSF、组合输入、候选窗口与上屏；Rime 和 `luna_pinyin` 提供基础候选。Smart IM 通过本机 Ollama 调用 Qwen 选择候选，并管理可选 SQLite 个人统计。Python 运行时仅使用标准库。
 
 ```mermaid
 flowchart LR
@@ -8,7 +8,7 @@ flowchart LR
     R --> L[Lua 候选快照]
     L --> F[本地文件信箱]
     F --> S[Python 服务]
-    S --> M[本地模型评分]
+    S --> M[本机 Ollama / Qwen]
     S <--> P[(SQLite 个人统计)]
     S --> F
     S --> N[Windows 前台刷新通知]
@@ -30,8 +30,7 @@ flowchart LR
 | `rime_refresh.py` | Windows 前台与输入状态校验、候选刷新通知 |
 | `rime_install.py` | 两个项目资源的安装、冲突预检和备份 |
 | `engine.py` | 外部候选排序、确认学习、统计查询与清空 |
-| `ranking.py` | 原始顺序先验、模型上下文增益和个人统计加分 |
-| `models.py` | 自带字符模型与 n-gram 评分 |
+| `ranking.py` | 校验模型排列、叠加个人统计并保留稳定顺序 |
 | `ollama_model.py` | 本机 Ollama 的最佳候选选择、限时请求与索引校验 |
 | `personalization.py` | 有界 SQLite 词频和短上下文统计 |
 | `cli.py` | `install-rime`、`serve`、`rerank`、`stats`、`reset` |
@@ -44,9 +43,9 @@ Lua 只缓冲前 9 个候选，从中选择与首候选 `start/_end` 一致的�
 
 刷新通知只由 Windows CLI 服务启用。请求首次出现时记录前台窗口、焦点及键盘布局；稳定窗口结束后重新校验，允许本次组合输入完成光标布局，并在按键松开后记录光标及最后输入时间。末字符仍按住时保留请求等待下次轮询，不提前计算一个无法通知的结果；焦点变化不会重新绑定旧请求。响应发布后再次确认请求未变化，且窗口、焦点、光标、输入状态均未改变、没有按键或鼠标按钮按住才发送通知。注入失败不重试、不影响基础输入；已完成结果仍可在下次候选重建时读取。这个机制复用[小狼毫自身鼠标选词的唤醒方式](https://github.com/rime/weasel/blob/master/WeaselTSF/CandidateList.cpp)，不安装键盘钩子，也不模拟 Tab 或确认键。其他前端没有停打时的主动唤醒。
 
-`Engine.rerank(texts, context, pinyin, private)` 返回零基排列，保留重复候选。评分结合 Rime 顺序先验、模型相对空上下文的有限增益及可选个人统计。无上下文且无个人证据时保持原序；模型失败时整批回退。
+`Engine.rerank(texts, context, pinyin, private)` 返回零基排列，保留重复候选。默认由 `OllamaReranker` 通过本机 `/api/chat` 调用 `qwen3:1.7b`，关闭流式输出和思考，使用 JSON Schema 约束最佳索引。模型比较“上下文 + 候选”短语，只输出 `{"best": index}`；客户端校验索引后构造完整排列，将最佳项提升到首位，其余保持 Rime 原序。
 
-可选 `CandidateReranker` 后端一次接受整组候选，返回严格校验的索引排列，作为可叠加个人统计的顺序先验。Ollama 默认通过本机 `/api/chat` 调用 Qwen3 1.7B，关闭流式输出和思考，使用 JSON Schema 约束最佳索引。模型比较“上下文 + 候选”短语，只输出 `{"best": index}`；客户端校验索引后构造完整排列，将最佳项提升到首位，其余保持 Rime 原序（含重复文本）。该提示选择不使用字符概率评分，也不训练新模型。无上下文不调用后端。超时、无效响应等错误由 Engine 整批回退，CLI 诊断命令返回非零退出码。
+模型排列作为后续个人统计调整的基础顺序。无上下文时不调用模型；无上下文且无个人证据时保持 Rime 原序。超时、无效响应等错误由 Engine 整批回退，CLI 诊断命令返回非零退出码。HTTP 仅接受本机回环地址，忽略代理环境变量，不跟随重定向。模型接口与边界见 [模型说明](MODEL_CARD.md)。
 
 ## 本地信箱
 

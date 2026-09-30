@@ -7,10 +7,10 @@ import sys
 import threading
 from pathlib import Path
 
-from .models import LocalLanguageModel
+from .ollama_model import OllamaReranker
 from .personalization import PersonalStore
 from .ranking import external_pinyin_key, rank_external
-from .types import CandidateReranker, LanguageModel
+from .types import CandidateReranker
 
 
 def default_data_dir() -> Path:
@@ -29,11 +29,11 @@ class Engine:
     def __init__(
         self,
         data_dir: Path | str | None = None,
-        model: LanguageModel | CandidateReranker | None = None,
+        model: CandidateReranker | None = None,
         learning: bool = False,
     ) -> None:
         self.data_dir = Path(data_dir) if data_dir is not None else default_data_dir()
-        self.model = model if model is not None else LocalLanguageModel()
+        self.model = model if model is not None else OllamaReranker()
         self.learning = learning
         self._store: PersonalStore | None = None
         self._lock = threading.RLock()

@@ -1,21 +1,31 @@
 """Real Lua → filesystem → Python engine → filesystem → Lua round trips."""
 
+import json
 import os
 import time
 
 import pytest
+from test_ollama_model import ollama_server as ollama_server
 from test_rime_lua import LuaHarness, identities
 
 from smart_im.engine import Engine
+from smart_im.ollama_model import OllamaReranker
 from smart_im.rime_protocol import parse_rank_request
 from smart_im.rime_service import MailboxService
 
 
-class FlatModel:
-    name = "integration-flat"
+class BatchModel:
+    name = "integration-batch"
 
-    def score(self, context, text):
-        return -3.0
+    def __init__(self, best=None):
+        self.best = best
+        self.calls = []
+
+    def rerank(self, context, texts, pinyin=""):
+        self.calls.append((context, texts, pinyin))
+        if self.best is None:
+            return list(range(len(texts)))
+        return [self.best, *(index for index in range(len(texts)) if index != self.best)]
 
 
 class LuaRefresh:
@@ -60,8 +70,10 @@ def composition_after(bridge, text):
     bridge.context.caret_pos = 6
 
 
-def test_bundled_model_updates_and_highlights_without_user_keypress(tmp_path, bridge):
-    engine = Engine(tmp_path / "personal")
+def test_ollama_response_updates_and_highlights_without_user_keypress(
+    tmp_path, bridge, ollama_server
+):
+    engine = Engine(tmp_path / "personal", OllamaReranker(endpoint=ollama_server.endpoint))
     with mailbox_service(bridge, engine, debounce_interval=0) as service:
         service.poll_once()
         composition_after(bridge, "系统支持")
@@ -83,6 +95,18 @@ def test_bundled_model_updates_and_highlights_without_user_keypress(tmp_path, br
         assert sorted(identities(output)) == [1, 2, 3]
         assert bridge.lua.eval("rawequal")(output[0], originals[2])
         assert originals[2].comment == "comment2"
+        assert len(ollama_server.requests) == 1
+        path, _, payload = ollama_server.requests[0]
+        assert path == "/api/chat"
+        assert payload["model"] == "qwen3:1.7b"
+        assert json.loads(payload["messages"][1]["content"]) == {
+            "context": "系统支持",
+            "pinyin": "shishi",
+            "options": [
+                {"index": index, "phrase": "系统支持" + text}
+                for index, text in enumerate(["事实", "实时", "实施"])
+            ],
+        }
         assert not (engine.data_dir / "learning.sqlite3").exists()
         assert service.refresh.notifications == 1
         service.poll_once()
@@ -90,7 +114,7 @@ def test_bundled_model_updates_and_highlights_without_user_keypress(tmp_path, br
 
 
 def test_mixed_whole_word_and_partial_candidates_complete_round_trip(tmp_path, bridge):
-    engine = Engine(tmp_path / "personal")
+    engine = Engine(tmp_path / "personal", BatchModel(best=1))
     with mailbox_service(bridge, engine, debounce_interval=0) as service:
         service.poll_once()
         composition_after(bridge, "系统支持")
@@ -111,6 +135,20 @@ def test_mixed_whole_word_and_partial_candidates_complete_round_trip(tmp_path, b
         assert output[1]._end == output[4]._end == 3
 
 
+def test_empty_context_keeps_native_order_without_ollama_request(tmp_path, bridge, ollama_server):
+    engine = Engine(tmp_path / "personal", OllamaReranker(endpoint=ollama_server.endpoint))
+    with mailbox_service(bridge, engine, debounce_interval=0) as service:
+        service.poll_once()
+        bridge.filter()
+        assert parse_rank_request(bridge.request_path.read_bytes()).context == ""
+        service.poll_once()
+        assert identities(bridge.displayed) == [1, 2, 3]
+        assert bridge.context.segment.prompt == "缺少上下文，保留原候选"
+        assert service.refresh.notifications == 1
+        assert ollama_server.requests == []
+        assert not (engine.data_dir / "learning.sqlite3").exists()
+
+
 @pytest.mark.parametrize("committed", [False, True])
 @pytest.mark.parametrize(
     "prefix,spelling,pinyin,texts",
@@ -122,17 +160,7 @@ def test_mixed_whole_word_and_partial_candidates_complete_round_trip(tmp_path, b
 def test_context_reaches_batch_ranker_and_response_updates_display(
     tmp_path, bridge, committed, prefix, spelling, pinyin, texts
 ):
-    class RecordingReranker:
-        name = "recording-reranker"
-
-        def __init__(self):
-            self.calls = []
-
-        def rerank(self, context, candidates, raw_pinyin):
-            self.calls.append((context, candidates, raw_pinyin))
-            return [1, 0, 2]
-
-    model = RecordingReranker()
+    model = BatchModel(best=1)
     engine = Engine(tmp_path / "personal", model)
     with mailbox_service(bridge, engine, debounce_interval=0) as service:
         service.poll_once()
@@ -162,7 +190,7 @@ def test_context_reaches_batch_ranker_and_response_updates_display(
 def test_commit_learning_requires_both_opt_ins_end_to_end(
     tmp_path, bridge, service_learns, client_learns
 ):
-    engine = Engine(tmp_path / "personal", FlatModel(), learning=service_learns)
+    engine = Engine(tmp_path / "personal", BatchModel(), learning=service_learns)
     with mailbox_service(bridge, engine, debounce_interval=0) as service:
         service.poll_once()
         bridge.option("smart_im_learning", client_learns)
@@ -184,7 +212,7 @@ def test_commit_learning_requires_both_opt_ins_end_to_end(
 
 
 def test_turning_learning_off_discards_ready_personalized_result(tmp_path, bridge):
-    engine = Engine(tmp_path / "personal", FlatModel(), learning=True)
+    engine = Engine(tmp_path / "personal", BatchModel(), learning=True)
     with mailbox_service(bridge, engine, debounce_interval=0) as service:
         service.poll_once()
         bridge.option("smart_im_learning", True)
@@ -209,7 +237,7 @@ def test_turning_learning_off_discards_ready_personalized_result(tmp_path, bridg
 
 
 def test_new_candidate_objects_cannot_apply_old_snapshot_response(tmp_path, bridge):
-    engine = Engine(tmp_path / "personal")
+    engine = Engine(tmp_path / "personal", BatchModel(best=1))
     with mailbox_service(bridge, engine, debounce_interval=0) as service:
         service.poll_once()
         composition_after(bridge, "系统支持")
@@ -232,7 +260,7 @@ def test_new_candidate_objects_cannot_apply_old_snapshot_response(tmp_path, brid
 
 
 def test_service_stop_discards_a_previously_ready_order(tmp_path, bridge):
-    engine = Engine(tmp_path / "personal")
+    engine = Engine(tmp_path / "personal", BatchModel(best=1))
     with mailbox_service(bridge, engine, debounce_interval=0) as service:
         service.poll_once()
         composition_after(bridge, "系统支持")
@@ -250,7 +278,7 @@ def test_service_stop_discards_a_previously_ready_order(tmp_path, bridge):
 def test_invalidated_composition_cancels_pending_or_discards_inflight_result(
     tmp_path, bridge, monkeypatch, action, inflight
 ):
-    engine = Engine(tmp_path / "personal", FlatModel())
+    engine = Engine(tmp_path / "personal", BatchModel())
     clock = [100.0]
     calls = []
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
@@ -287,7 +315,7 @@ def test_invalidated_composition_cancels_pending_or_discards_inflight_result(
 
 
 def test_rebuilding_candidates_recovers_after_service_expires_idle_files(tmp_path, bridge):
-    engine = Engine(tmp_path / "personal", FlatModel(), learning=True)
+    engine = Engine(tmp_path / "personal", BatchModel(), learning=True)
     with mailbox_service(bridge, engine, debounce_interval=0) as service:
         service.poll_once()
         bridge.option("smart_im_learning", True)
@@ -311,11 +339,9 @@ def test_rebuilding_candidates_recovers_after_service_expires_idle_files(tmp_pat
 
 
 def test_real_engine_model_failure_never_highlights_a_recommendation(tmp_path, bridge):
-    class BrokenModel(FlatModel):
-        def score(self, context, text):
-            if text == "实施":
-                raise RuntimeError("model unavailable after some candidates were scored")
-            return -1.0 if context and text == "实时" else -5.0
+    class BrokenModel(BatchModel):
+        def rerank(self, context, texts, pinyin=""):
+            raise RuntimeError("private context must not appear in the fallback response")
 
     engine = Engine(tmp_path / "personal", BrokenModel())
     with mailbox_service(bridge, engine, debounce_interval=0) as service:

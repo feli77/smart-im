@@ -1,21 +1,22 @@
-import math
-
 import pytest
 
 from smart_im.engine import Engine
-from smart_im.ranking import external_pinyin_key, rank_external
+from smart_im.ranking import external_pinyin_key
 
 
 class ContextModel:
     name = "context-test"
 
-    def score(self, context, text):
-        return -1.0 if (context, text) in {("执行", "实施"), ("这是", "事实")} else -5.0
+    def rerank(self, context, texts, pinyin=""):
+        return sorted(
+            range(len(texts)),
+            key=lambda index: (context, texts[index]) not in {("执行", "实施"), ("这是", "事实")},
+        )
 
 
 class FlatModel(ContextModel):
-    def score(self, context, text):
-        return -3.0
+    def rerank(self, context, texts, pinyin=""):
+        return list(range(len(texts)))
 
 
 def test_external_rank_uses_context_and_explicit_learning(tmp_path):
@@ -39,7 +40,7 @@ def test_duplicates_remain_distinct_indices_and_input_is_unchanged(tmp_path):
 @pytest.mark.parametrize("context", ["", " \n\t"])
 def test_without_context_rime_order_wins_and_model_is_not_called(tmp_path, context):
     class NoModel(FlatModel):
-        def score(self, context, text):
+        def rerank(self, context, texts, pinyin=""):
             raise AssertionError("No contextual evidence: keep Rime ranking")
 
     with Engine(tmp_path, NoModel()) as engine:
@@ -48,36 +49,22 @@ def test_without_context_rime_order_wins_and_model_is_not_called(tmp_path, conte
     assert not (tmp_path / "learning.sqlite3").exists()
 
 
-@pytest.mark.parametrize("bad_score", [None, math.nan, math.inf, -math.inf, "bad"])
-def test_partial_model_failure_restores_entire_original_order(tmp_path, bad_score):
+def test_model_failure_restores_entire_original_order_including_personal_boosts(tmp_path):
     class BrokenModel(ContextModel):
-        def score(self, context, text):
-            if text == "实时":
-                if bad_score is None:
-                    raise RuntimeError("model failed after scoring an earlier candidate")
-                return bad_score
-            return super().score(context, text)
+        def rerank(self, context, texts, pinyin=""):
+            raise RuntimeError("model failed")
 
     with Engine(tmp_path, BrokenModel(), learning=True) as engine:
         for _ in range(5):
             engine.commit_external("shishi", "实施", "执行")
         assert engine.rerank(["事实", "实时", "实施"], "执行", "shishi") == [0, 1, 2]
-        assert engine.stats()["model_error"] is not None
-
-
-def test_failure_in_empty_context_baseline_also_restores_original(tmp_path):
-    class BadBaseline(ContextModel):
-        def score(self, context, text):
-            return math.nan if not context else -1.0
-
-    with Engine(tmp_path, BadBaseline()) as engine:
-        assert engine.rerank(["事实", "实施"], "执行") == [0, 1]
+        assert engine.stats()["model_error"] == "RuntimeError"
 
 
 @pytest.mark.parametrize("texts", [[], ["事实"]])
 def test_noop_ranking_clears_previous_model_failure_status(tmp_path, texts):
     class BrokenModel(FlatModel):
-        def score(self, context, text):
+        def rerank(self, context, texts, pinyin=""):
             raise RuntimeError("model failed")
 
     with Engine(tmp_path, BrokenModel()) as engine:
@@ -145,30 +132,15 @@ def test_valid_pool_edges_and_context_bound(tmp_path):
     contexts = []
 
     class RecordingModel(FlatModel):
-        def score(self, context, text):
+        def rerank(self, context, texts, pinyin=""):
             contexts.append(context)
-            return super().score(context, text)
+            return super().rerank(context, texts, pinyin)
 
     with Engine(tmp_path, RecordingModel()) as engine:
         assert engine.rerank([]) == []
         assert engine.rerank(["字" * 64]) == [0]
         assert engine.rerank(["字"] * 32, "前" * 200) == list(range(32))
-    assert contexts == ["前" * 128, ""]
-
-
-def test_model_evidence_is_bounded_and_ties_are_stable():
-    class HugeModel(FlatModel):
-        def score(self, context, text):
-            return 1e100 if context and text == "尾" else -1e100
-
-    texts = [str(index) for index in range(31)] + ["尾"]
-    assert rank_external(texts, "上下文", HugeModel(), {}, {})[0] == 0
-
-    class TieModel(FlatModel):
-        def score(self, context, text):
-            return 0.35 / 0.85 if context and text == "乙" else 0.0
-
-    assert rank_external(["甲", "乙"], "上下文", TieModel(), {}, {}) == [0, 1]
+    assert contexts == ["前" * 128]
 
 
 def test_external_key_supports_tones_separators_and_abbreviations():
@@ -199,7 +171,10 @@ def test_batch_reranker_receives_one_bounded_pool_and_personal_learning_still_wo
         assert engine.rerank(texts, "前", "shishi", private=True) == [2, 0, 1]
 
 
-@pytest.mark.parametrize("order", [[0, 0, 2], [True, 0, 2], [2, 0], [3, 0, 1], [0.0, 1, 2]])
+@pytest.mark.parametrize(
+    "order",
+    [[0, 0, 2], [True, 0, 2], [2, 0], [3, 0, 1], [0.0, 1, 2], [-1, 0, 1], (0, 1, 2), None],
+)
 def test_invalid_batch_order_restores_original_including_personal_boosts(tmp_path, order):
     class BatchModel:
         name = "broken-batch"

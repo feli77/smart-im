@@ -6,8 +6,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      OPENBLAS_NUM_THREADS: 1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,4 +15,4 @@ jobs:
       - run: python -m pytest -q
       - run: python -m ruff check .
       - run: python -m ruff format --check .
-      - run: python -m smart_im rerank 实时 事实 实施 --pinyin shishi --context 我们计划
+      - run: python -m smart_im rerank 实时 事实 实施 --pinyin shishi

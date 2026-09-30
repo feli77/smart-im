@@ -1,4 +1,4 @@
-"""Rime engine regressions for offline use and bounded personal learning."""
+"""Rime engine regressions for Ollama defaults and bounded personal learning."""
 
 import socket
 import sqlite3
@@ -6,24 +6,30 @@ import sqlite3
 import pytest
 
 from smart_im.engine import Engine
+from smart_im.ollama_model import OllamaReranker
 
 
 class FlatModel:
     name = "test-flat"
 
-    def score(self, context, text):
-        return -1.0
+    def rerank(self, context, texts, pinyin=""):
+        return list(range(len(texts)))
 
 
-def test_bundled_ranking_is_offline_and_does_not_create_personal_data(tmp_path, monkeypatch):
+def test_default_ollama_setup_and_contextless_ranking_perform_no_network_or_storage_io(
+    tmp_path, monkeypatch
+):
     def no_network(*args, **kwargs):
         raise AssertionError("core attempted network access")
 
     monkeypatch.setattr(socket, "socket", no_network)
     data_dir = tmp_path / "personal"
     with Engine(data_dir) as engine:
-        assert engine.rerank(["实时", "事实", "实施"], "我们计划") == [2, 0, 1]
+        assert isinstance(engine.model, OllamaReranker)
+        assert engine.model.model == "qwen3:1.7b"
+        assert engine.rerank(["实时", "事实", "实施"]) == [0, 1, 2]
         assert engine.stats()["selections"] == 0
+        assert engine.stats()["model_error"] is None
     assert not data_dir.exists()
 
 
@@ -78,8 +84,8 @@ def test_existing_store_is_not_opened_for_private_or_disabled_learning(
 
 def test_model_error_does_not_expose_exception_text(tmp_path):
     class BrokenModel(FlatModel):
-        def score(self, context, text):
-            raise RuntimeError("private input: " + context + text)
+        def rerank(self, context, texts, pinyin=""):
+            raise RuntimeError("private input: " + context + "".join(texts))
 
     with Engine(tmp_path, BrokenModel()) as engine:
         assert engine.rerank(["事实", "实施"], "敏感上下文") == [0, 1]

@@ -1,6 +1,8 @@
+import json
 from pathlib import Path
 
 import pytest
+from test_ollama_model import ollama_server as ollama_server
 
 from smart_im.cli import main
 from smart_im.rime_install import install_rime
@@ -36,10 +38,29 @@ def test_install_cli(tmp_path, capsys):
     assert "Smart IM" in capsys.readouterr().out
 
 
-def test_rerank_cli_is_permutation(capsys):
-    import json
-
-    assert main(["rerank", "实时", "事实", "实施", "--context", "我们计划"]) == 0
+def test_rerank_cli_is_permutation(tmp_path, capsys, ollama_server):
+    assert (
+        main(
+            [
+                "--data-dir",
+                str(tmp_path),
+                "rerank",
+                "实时",
+                "事实",
+                "实施",
+                "--context",
+                "我们计划",
+                "--ollama-url",
+                ollama_server.endpoint,
+            ]
+        )
+        == 0
+    )
     result = json.loads(capsys.readouterr().out)
-    assert sorted(result["order"]) == [0, 1, 2]
-    assert sorted(result["candidates"]) == sorted(["实时", "事实", "实施"])
+    assert result == {"order": [1, 0, 2], "candidates": ["事实", "实时", "实施"]}
+    assert len(ollama_server.requests) == 1
+    path, _, payload = ollama_server.requests[0]
+    assert path == "/api/chat"
+    assert payload["model"] == "qwen3:1.7b"
+    assert json.loads(payload["messages"][1]["content"])["context"] == "我们计划"
+    assert not (tmp_path / "learning.sqlite3").exists()
