@@ -50,7 +50,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/doctor_tsf.ps1
 Start-Process tests/manual/tsf_context.html
 ```
 
-彻底退出并重新打开测试应用；浏览器也要退出全部进程后再开。已经加载旧 TSF DLL 的进程不会因重启服务而切换到新版，必要时保存工作后注销、登录。再次检查 doctor 的 `[loaded TSF]` 结果，不能只看磁盘文件检查。诊断成功不代替实际输入验收。先在验收页预置正文中把光标放到“计划”后，输入拼音，再测试移动光标和切换两个输入框；详细通过条件见下方验收表。本轮已部署的 Lua 与仓库一致，无需再部署。真实应用的读取和失效行为目前仍待验证。
+彻底退出并重新打开测试应用；浏览器也要退出全部进程后再开。已经加载旧 TSF DLL 的进程不会因重启服务而切换到新版，必要时保存工作后注销、登录。再次检查 doctor 的 `[loaded TSF]` 结果，不能只看磁盘文件检查。诊断成功不代替实际输入验收。先在验收页预置正文中把光标放到“计划”后，输入拼音，再测试移动光标和切换两个输入框；详细通过条件见下方验收表。本轮已部署的 Lua 与仓库一致，无需再部署。用户已确认最终修复后使用正常，诊断也记录到读取和发送成功；这不代表所有应用及每项失效场景均已逐一人工验收，证据范围见 [验证记录](VALIDATION.md)。
 
 ### 临时开启原生读取诊断
 
@@ -83,7 +83,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_weasel_tsf.p
 
 ## 小狼毫源码与补丁
 
-以官方 [rime/weasel 0.17.4](https://github.com/rime/weasel/tree/0.17.4) 为基线，固定提交 `9cc96e20dc71b80876b12f689bb5863c76c2a7ed`。本地开发分支是 `codex/tsf-local-context`，补丁保存于 [patches/weasel](../patches/weasel)。开发分支未合并或推送；用户已安装前版原生测试包，后续诊断包的安装和验证结果应分别记录，不能将初始阶段的“未安装”当作当前状态。
+以官方 [rime/weasel 0.17.4](https://github.com/rime/weasel/tree/0.17.4) 为基线，固定提交 `9cc96e20dc71b80876b12f689bb5863c76c2a7ed`。独立小狼毫源码仓库的本地开发分支是 `codex/tsf-local-context`，没有向小狼毫上游合并或推送；可复现补丁保存在 Smart IM 的 [patches/weasel](../patches/weasel)，随 Smart IM 源码发布。本机 `artifacts` 下的测试二进制不随 Git 标签发布。用户已安装最终修复包，具体构建、安装及实机证据见 [验证记录](VALIDATION.md)。
 
 在 Smart IM 仓库根目录复现（目标目录需尚不存在）：
 

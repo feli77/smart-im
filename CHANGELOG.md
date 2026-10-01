@@ -2,6 +2,18 @@
 
 Generated from Git history with git-cliff. Changes without a version tag appear under Unreleased.
 
+## [0.5.0] - 2026-10-01
+
+### Bug Fixes
+
+- **tsf:** Deliver native test build and diagnose missing context
+- **installer:** Bound Weasel shutdown and registration waits
+- **installer:** Resume interrupted native binary updates
+- **tsf:** Read Chromium local context and diagnose loaded versions
+
+### Features
+
+- **context:** Integrate TSF local context with Weasel
 ## [0.4.0] - 2026-09-30
 
 ### Refactoring
