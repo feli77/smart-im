@@ -2,6 +2,47 @@
 
 本分支把上下文来源改为小狼毫 TSF text store。Rime 继续负责拼音、分段、基础候选和上屏；Smart IM 只在既有候选内重排。此前 Lua 累积上屏历史的逻辑已移除。
 
+## 一直提示未获取到局部上下文
+
+先在仓库目录运行只读诊断：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/doctor_tsf.ps1
+```
+
+它检查正在运行的服务端、安装目录和 Windows 实际注册的两种位数 TSF DLL、Lua 版本与服务心跳，不读取正文或请求文件。仅部署 Lua 不会安装 TSF 扩展。2026-10-01 本机故障确认属于此情况：Lua 已更新、心跳正常，但服务端和两个系统 DLL 仍是原版。
+
+本机已构建测试包 `artifacts/weasel-tsf-0.17.4-test`，含 64 位服务端、64/32 位 TSF DLL 和 SHA256 清单。适用范围是当前 x64 Windows、简体小狼毫 0.17.4；不包含或替换 `rime.dll`、插件、词库和用户配置。它是本地测试产物，不是已发布版本。
+
+保存正在输入的内容、暂时切到其他输入法后，在 **64 位管理员 PowerShell** 中进入本仓库，执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_weasel_tsf.ps1 `
+  -PackageDir artifacts/weasel-tsf-0.17.4-test `
+  -BackupDir "$env:LOCALAPPDATA\SmartIM\weasel-backup-$(Get-Date -Format yyyyMMdd-HHmmss)"
+```
+
+脚本先完整备份本次涉及的文件和注册信息，再退出服务，覆盖三个原生文件，通过现有官方 `WeaselSetup.exe /s` 复制、注册两个系统 DLL，最后核对哈希和注册路径。它要求现有 `Hant=0`，会重新启用简体输入 profile；不部署词库，不从管理员会话启动服务。记下输出的备份路径。
+
+安装完成后关闭管理员终端，在**普通 PowerShell** 中执行：
+
+```powershell
+Start-Process -FilePath 'C:\Program Files\Rime\weasel-0.17.4\WeaselServer.exe' -WindowStyle Hidden
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/doctor_tsf.ps1
+Start-Process tests/manual/tsf_context.html
+```
+
+彻底退出并重新打开测试应用；浏览器也要退出全部进程后再开。已经加载旧 TSF DLL 的进程不会因重启服务而切换到新版，必要时保存工作后注销、登录。诊断成功只表示磁盘上的二进制、注册、Lua 和心跳配套，不代替实际输入验收。先在验收页预置正文中把光标放到“计划”后，输入拼音，再测试移动光标和切换两个输入框；详细通过条件见下方验收表。本次已部署的 Lua 与仓库一致，无需再部署。
+
+若需回滚，在管理员终端使用安装时实际输出的备份路径：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_weasel_tsf.ps1 `
+  -Rollback -BackupDir '实际备份路径'
+```
+
+随后同样从普通终端启动服务并重开应用。回滚只恢复本次原生文件并用原安装器登记，不导入整棵用户输入法注册树。回到原版原生组件后，新 Lua 会恢复“未获取到局部上下文”的降级行为。
+
 ## 小狼毫源码与补丁
 
 以官方 [rime/weasel 0.17.4](https://github.com/rime/weasel/tree/0.17.4) 为基线，固定提交 `9cc96e20dc71b80876b12f689bb5863c76c2a7ed`。本地开发分支是 `codex/tsf-local-context`，补丁保存于 [patches/weasel](../patches/weasel)。本次开发没有合并、推送、注册 TSF DLL 或替换正在使用的小狼毫。
@@ -15,7 +56,20 @@ $patchPath = (Resolve-Path patches/weasel/0001-tsf-local-context.patch).Path
 git -C artifacts/weasel-smart-im -c core.whitespace=cr-at-eol am --keep-cr $patchPath
 ```
 
-构建需要 Visual Studio C++/ATL、Windows SDK、Boost 及小狼毫原有依赖。按照该版本的 `env.vs2022.bat`、`build.bat` 与 `.github/workflows/commit-ci.yml` 配置编译环境。前端 `WeaselTSF`、`WeaselIPC` 与 `WeaselServer`/`RimeWithWeasel` 必须一起使用补丁版本，新 IPC 命令不能由原版服务端处理。完成二进制安装后，仍需在本项目执行 `uv run smart-im install-rime --force` 并重新部署 Lua。
+构建需要 Visual Studio 2022 C++/ATL、Windows SDK、完整 Boost 1.84.0 源码和官方 librime 1.17.0 Windows MSVC x64/x86 SDK。前端 `WeaselTSF`、`WeaselIPC` 与 `WeaselServer`/`RimeWithWeasel` 必须一起使用补丁版本，新 IPC 命令不能由原版服务端处理。
+
+完整构建脚本会检查依赖版本、编译两种位数静态 Boost、链接前端与服务端并生成三文件测试包。`PackageDir` 必须是新目录或空目录；脚本不下载依赖、不停止服务、不安装输入法：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_weasel_tsf.ps1 `
+  -WeaselRoot artifacts/weasel-smart-im `
+  -BoostRoot artifacts/native-deps/boost_1_84_0 `
+  -RimeSdkX64 artifacts/native-deps/librime-1.17.0/rime-33e7814-Windows-msvc-x64 `
+  -RimeSdkX86 artifacts/native-deps/librime-1.17.0/rime-33e7814-Windows-msvc-x86 `
+  -PackageDir artifacts/weasel-tsf-rebuilt
+```
+
+本机已安装的 `rime.dll` 自报版本 1.17.0，故构建使用 [固定 1.17.0 SDK](https://github.com/rime/librime/releases/tag/1.17.0) 的头文件和导入库；运行时保留本机现有 DLL 和 Lua 插件。首次配置 Smart IM 的机器仍需 `uv run smart-im install-rime --force` 并重新部署 Lua。
 
 本地原生测试命令（VS C++ 工具已安装）：
 

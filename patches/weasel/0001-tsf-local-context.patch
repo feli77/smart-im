@@ -1,7 +1,7 @@
 From a89a78e8d44af3bb793c17cab045cd437f35f0c8 Mon Sep 17 00:00:00 2001
 From: felix07 <l.shuheng@stu.xjtu.edu.cn>
 Date: Thu, 1 Oct 2026 13:13:12 +0800
-Subject: [PATCH] feat(tsf): publish local document context for Smart IM
+Subject: [PATCH 1/4] feat(tsf): publish local document context for Smart IM
 
 ---
  RimeWithWeasel/RimeWithWeasel.cpp    |  25 +++
@@ -1902,3 +1902,343 @@ index 0000000..ce4157f
 +  }
 +  return 1;
 +}
+
+From 05f44708bb49390626064bbd346b448c4f2906d1 Mon Sep 17 00:00:00 2001
+From: felix07 <l.shuheng@stu.xjtu.edu.cn>
+Date: Thu, 1 Oct 2026 15:31:52 +0800
+Subject: [PATCH 2/4] fix(tsf): handle absent input scope properties
+
+---
+ WeaselTSF/LocalContext.cpp           |  44 +---------
+ WeaselTSF/LocalContext.h             |  47 ++++++++++
+ WeaselTSF/tests/LocalContextTest.cpp | 127 +++++++++++++++++++++++++++
+ 3 files changed, 176 insertions(+), 42 deletions(-)
+
+diff --git a/WeaselTSF/LocalContext.cpp b/WeaselTSF/LocalContext.cpp
+index c63dcbb..a2201d2 100644
+--- a/WeaselTSF/LocalContext.cpp
++++ b/WeaselTSF/LocalContext.cpp
+@@ -1,52 +1,12 @@
+ #include "stdafx.h"
+ #include "EditSession.h"
++#include <initguid.h>
+ #include "LocalContext.h"
+ #include <SmartIMContext.h>
+ #include <inputscope.h>
+ 
+ namespace {
+ 
+-// Input scope is optional (VT_EMPTY). Malformed/failed scope reads cannot
+-// authorize collecting text. Disabled/secure contexts are rejected earlier.
+-bool AllowsContext(ITfContext* context, TfEditCookie ec, ITfRange* selection) {
+-  CComPtr<ITfReadOnlyProperty> property;
+-  if (FAILED(context->GetAppProperty(GUID_PROP_INPUTSCOPE, &property)) || !property)
+-    return false;
+-  CComVariant value;
+-  if (FAILED(property->GetValue(ec, selection, &value)))
+-    return false;
+-  if (value.vt == VT_EMPTY)
+-    return true;
+-  if (value.vt != VT_UNKNOWN || !value.punkVal)
+-    return false;
+-  CComPtr<ITfInputScope> scope;
+-  if (FAILED(value.punkVal->QueryInterface(IID_PPV_ARGS(&scope))))
+-    return false;
+-  InputScope* scopes = nullptr;
+-  UINT count = 0;
+-  if (FAILED(scope->GetInputScopes(&scopes, &count))) {
+-    CoTaskMemFree(scopes);
+-    return false;
+-  }
+-  bool allowed = count == 0 || scopes != nullptr;
+-  for (UINT i = 0; allowed && i < count; ++i) {
+-    switch (scopes[i]) {
+-      case IS_PASSWORD:
+-      case IS_PRIVATE:
+-      case IS_NUMERIC_PASSWORD:
+-      case IS_NUMERIC_PIN:
+-      case IS_ALPHANUMERIC_PIN:
+-      case IS_ALPHANUMERIC_PIN_SET:
+-        allowed = false;
+-        break;
+-      default:
+-        break;
+-    }
+-  }
+-  CoTaskMemFree(scopes);
+-  return allowed;
+-}
+-
+ class CReadLocalContextSession : public CEditSession {
+  public:
+   CReadLocalContextSession(WeaselTSF* service, ITfContext* context)
+@@ -99,7 +59,7 @@ bool WeaselTSF::_ReadLocalContext(ITfContext* context,
+     return false;
+   CComPtr<ITfRange> selectionRange;
+   selectionRange.Attach(selection.range);
+-  if (!AllowsContext(context, ec, selectionRange))
++  if (!smart_im::AllowsContext(context, ec, selectionRange))
+     return false;
+ 
+   CComPtr<ITfRange> replacement = selectionRange;
+diff --git a/WeaselTSF/LocalContext.h b/WeaselTSF/LocalContext.h
+index 6701900..b57eb68 100644
+--- a/WeaselTSF/LocalContext.h
++++ b/WeaselTSF/LocalContext.h
+@@ -3,6 +3,7 @@
+ #include <string>
+ #include <windows.h>
+ #include <msctf.h>
++#include <inputscope.h>
+ #include <atlcomcli.h>
+ 
+ namespace smart_im {
+@@ -77,4 +78,50 @@ inline bool Utf8Hex(const std::wstring& text, std::wstring& result) {
+   return true;
+ }
+ 
++// Missing optional input scopes are not password markers. Secure mode and
++// disabled input are checked by the caller before accessing document text.
++inline bool AllowsContext(ITfContext* context, TfEditCookie ec, ITfRange* selection) {
++  CComPtr<ITfReadOnlyProperty> property;
++  const HRESULT propertyResult = context->GetAppProperty(GUID_PROP_INPUTSCOPE, &property);
++  // TSF documents S_FALSE for an unsupported property and E_NOTIMPL for an
++  // owner without application properties. Both mean there is no scope hint.
++  if (propertyResult == S_FALSE || propertyResult == E_NOTIMPL)
++    return true;
++  if (FAILED(propertyResult) || !property)
++    return false;
++  CComVariant value;
++  if (FAILED(property->GetValue(ec, selection, &value)))
++    return false;
++  if (value.vt == VT_EMPTY)
++    return true;
++  if (value.vt != VT_UNKNOWN || !value.punkVal)
++    return false;
++  CComPtr<ITfInputScope> scope;
++  if (FAILED(value.punkVal->QueryInterface(IID_PPV_ARGS(&scope))))
++    return false;
++  InputScope* scopes = nullptr;
++  UINT count = 0;
++  if (FAILED(scope->GetInputScopes(&scopes, &count))) {
++    CoTaskMemFree(scopes);
++    return false;
++  }
++  bool allowed = count == 0 || scopes != nullptr;
++  for (UINT i = 0; allowed && i < count; ++i) {
++    switch (scopes[i]) {
++      case IS_PASSWORD:
++      case IS_PRIVATE:
++      case IS_NUMERIC_PASSWORD:
++      case IS_NUMERIC_PIN:
++      case IS_ALPHANUMERIC_PIN:
++      case IS_ALPHANUMERIC_PIN_SET:
++        allowed = false;
++        break;
++      default:
++        break;
++    }
++  }
++  CoTaskMemFree(scopes);
++  return allowed;
++}
++
+ }  // namespace smart_im
+diff --git a/WeaselTSF/tests/LocalContextTest.cpp b/WeaselTSF/tests/LocalContextTest.cpp
+index 183346c..cdef513 100644
+--- a/WeaselTSF/tests/LocalContextTest.cpp
++++ b/WeaselTSF/tests/LocalContextTest.cpp
+@@ -1,6 +1,9 @@
+ // Standalone Windows SDK/ATL test: cl /std:c++17 /EHsc /utf-8 /DUNICODE
+ // /D_UNICODE LocalContextTest.cpp /link ole32.lib oleaut32.lib uuid.lib
+ #define NOMINMAX
++#include <windows.h>
++#include <ole2.h>
++#include <initguid.h>
+ #include "../LocalContext.h"
+ #include <algorithm>
+ #include <cassert>
+@@ -129,7 +132,131 @@ static void ExpectAround(ITfRange* replacement,
+   assert(actualBefore == before && actualAfter == after);
+ }
+ 
++// These stack-owned COM fixtures exercise the production input-scope reader,
++// including hosts which do not implement the optional application property.
++template <class Interface>
++class ComFixture : public Interface {
++ public:
++  STDMETHODIMP QueryInterface(REFIID iid, void** out) override {
++    *out = nullptr;
++    if (iid != IID_IUnknown && iid != __uuidof(Interface)) return E_NOINTERFACE;
++    *out = static_cast<Interface*>(this);
++    AddRef();
++    return S_OK;
++  }
++  STDMETHODIMP_(ULONG) AddRef() override { return ++references; }
++  STDMETHODIMP_(ULONG) Release() override { return --references; }
++  ULONG references = 1;
++};
++
++#define UNUSED_METHOD(name, args) STDMETHODIMP name args override { return E_NOTIMPL; }
++
++class ScopeFixture : public ComFixture<ITfInputScope> {
++ public:
++  InputScope scope = IS_DEFAULT;
++  HRESULT result = S_OK;
++  STDMETHODIMP GetInputScopes(InputScope** scopes, UINT* count) override {
++    *scopes = nullptr;
++    *count = 0;
++    if (FAILED(result)) return result;
++    *scopes = static_cast<InputScope*>(CoTaskMemAlloc(sizeof(InputScope)));
++    if (!*scopes) return E_OUTOFMEMORY;
++    **scopes = scope;
++    *count = 1;
++    return result;
++  }
++  UNUSED_METHOD(GetPhrase, (BSTR**, UINT*))
++  UNUSED_METHOD(GetRegularExpression, (BSTR*))
++  UNUSED_METHOD(GetSRGS, (BSTR*))
++  UNUSED_METHOD(GetXML, (BSTR*))
++};
++
++class PropertyFixture : public ComFixture<ITfReadOnlyProperty> {
++ public:
++  ScopeFixture scope;
++  VARTYPE type = VT_EMPTY;
++  HRESULT result = S_OK;
++  STDMETHODIMP GetValue(TfEditCookie ec, ITfRange*, VARIANT* value) override {
++    assert(ec == 42);
++    VariantInit(value);
++    if (FAILED(result)) return result;
++    value->vt = type;
++    if (type == VT_UNKNOWN) {
++      value->punkVal = &scope;
++      scope.AddRef();
++    }
++    return result;
++  }
++  UNUSED_METHOD(GetType, (GUID*))
++  UNUSED_METHOD(EnumRanges, (TfEditCookie, IEnumTfRanges**, ITfRange*))
++  UNUSED_METHOD(GetContext, (ITfContext**))
++};
++
++class ContextFixture : public ComFixture<ITfContext> {
++ public:
++  HRESULT result = S_FALSE;
++  PropertyFixture property;
++  STDMETHODIMP GetAppProperty(REFGUID guid, ITfReadOnlyProperty** out) override {
++    assert(guid == GUID_PROP_INPUTSCOPE);
++    *out = nullptr;
++    if (result == S_OK) { *out = &property; property.AddRef(); }
++    return result;
++  }
++  UNUSED_METHOD(RequestEditSession, (TfClientId, ITfEditSession*, DWORD, HRESULT*))
++  UNUSED_METHOD(InWriteSession, (TfClientId, BOOL*))
++  UNUSED_METHOD(GetSelection, (TfEditCookie, ULONG, ULONG, TF_SELECTION*, ULONG*))
++  UNUSED_METHOD(SetSelection, (TfEditCookie, ULONG, const TF_SELECTION*))
++  UNUSED_METHOD(GetStart, (TfEditCookie, ITfRange**))
++  UNUSED_METHOD(GetEnd, (TfEditCookie, ITfRange**))
++  UNUSED_METHOD(GetActiveView, (ITfContextView**))
++  UNUSED_METHOD(EnumViews, (IEnumTfContextViews**))
++  UNUSED_METHOD(GetStatus, (TF_STATUS*))
++  UNUSED_METHOD(GetProperty, (REFGUID, ITfProperty**))
++  UNUSED_METHOD(TrackProperties, (const GUID**, ULONG, const GUID**, ULONG, ITfReadOnlyProperty**))
++  UNUSED_METHOD(EnumProperties, (IEnumTfProperties**))
++  UNUSED_METHOD(GetDocumentMgr, (ITfDocumentMgr**))
++  UNUSED_METHOD(CreateRangeBackup, (TfEditCookie, ITfRange*, ITfRangeBackup**))
++};
++
++#undef UNUSED_METHOD
++
++static void TestInputScopes() {
++  ContextFixture context;
++  // No property object is returned for these documented optional-property cases.
++  assert(smart_im::AllowsContext(&context, 42, nullptr));
++  context.result = E_NOTIMPL;
++  assert(smart_im::AllowsContext(&context, 42, nullptr));
++  for (HRESULT failure : {E_FAIL, E_INVALIDARG, TF_E_DISCONNECTED, E_OUTOFMEMORY}) {
++    context.result = failure;
++    assert(!smart_im::AllowsContext(&context, 42, nullptr));
++  }
++  context.result = S_OK;
++  assert(smart_im::AllowsContext(&context, 42, nullptr)); // VT_EMPTY
++  context.property.result = S_FALSE;
++  assert(smart_im::AllowsContext(&context, 42, nullptr)); // uncovered property
++  context.property.result = TF_E_NOLOCK;
++  assert(!smart_im::AllowsContext(&context, 42, nullptr));
++  context.property.result = S_OK;
++  context.property.type = VT_I4;
++  assert(!smart_im::AllowsContext(&context, 42, nullptr));
++  context.property.type = VT_UNKNOWN;
++  assert(smart_im::AllowsContext(&context, 42, nullptr)); // IS_DEFAULT
++  context.property.scope.scope = IS_TEXT;
++  assert(smart_im::AllowsContext(&context, 42, nullptr));
++  for (InputScope privateScope : {IS_PASSWORD, IS_PRIVATE, IS_NUMERIC_PASSWORD,
++                                 IS_NUMERIC_PIN, IS_ALPHANUMERIC_PIN,
++                                 IS_ALPHANUMERIC_PIN_SET}) {
++    context.property.scope.scope = privateScope;
++    assert(!smart_im::AllowsContext(&context, 42, nullptr));
++  }
++  context.property.scope.scope = IS_TEXT;
++  context.property.scope.result = E_FAIL;
++  assert(!smart_im::AllowsContext(&context, 42, nullptr));
++  assert(context.property.references == 1 && context.property.scope.references == 1);
++}
++
+ int main() {
++  TestInputScopes();
+   // Existing text is read at the insertion point without any commit history.
+   auto doc = DocumentWith(L"原有语境。这里继续。");
+   ExpectAround(At(doc, 5, 5), L"原有语境。", L"这里继续。");
+
+From 846294e8fbdd8a7d04e9d130ebf607bf4d474420 Mon Sep 17 00:00:00 2001
+From: felix07 <l.shuheng@stu.xjtu.edu.cn>
+Date: Thu, 1 Oct 2026 15:33:52 +0800
+Subject: [PATCH 3/4] chore(tsf): identify context builds in version resources
+
+---
+ WeaselTSF/WeaselTSF.rc | Bin 15922 -> 16216 bytes
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+
+diff --git a/WeaselTSF/WeaselTSF.rc b/WeaselTSF/WeaselTSF.rc
+index 648bad1d09558829b6f53d375e5469e239cdf6c2..3a7fba11a1ca7a94e42c894228d6b72962c03f8c 100644
+GIT binary patch
+delta 192
+zcmV;x06+h-eAs@l{wOt50Brza0CE6y07(E%07C$80B!(u0A&Dp0CWIQ0CE6t0CWIv
+z0Am1e0Bisv04x9?03rY}v(YF61T|9tZ2(~aasYGyNdQd%LjZ38ZUA%uWdL{pbO2BQ
+zasY1tbO3JvV*qaeYyctvEC3(?A^<Uy(I{K90xjMHHB$g>0AT=f0CWIJ08Icx0B-<p
+u0CWIl0C)g&08jvO0B-<v0B-<e0B-<n03rY^03ZM&05Ox%C{eQnF)j_OYAO~0
+
+delta 30
+ocmV+(0O9}GezJV9{wT9xDb@p%U@0!M#x33hlVB+%vnnz!4d^Wl%K!iX
+
+
+From 407edb7620de82b8882c91dcf810aa5c22a7f866 Mon Sep 17 00:00:00 2001
+From: felix07 <l.shuheng@stu.xjtu.edu.cn>
+Date: Thu, 1 Oct 2026 15:36:36 +0800
+Subject: [PATCH 4/4] build(windows): use SDK resource headers for TSF test
+ builds
+
+---
+ WeaselServer/WeaselServer.rc | Bin 22800 -> 22800 bytes
+ WeaselTSF/WeaselTSF.rc       | Bin 16216 -> 16216 bytes
+ 2 files changed, 0 insertions(+), 0 deletions(-)
+
+diff --git a/WeaselServer/WeaselServer.rc b/WeaselServer/WeaselServer.rc
+index 53fcadd45ddf3bd25a067c053c65aefe67d366fe..af9a3d64a38051738bdc0f2b9f19de319c5931ac 100644
+GIT binary patch
+delta 31
+pcmV+)0O0?SvH_5?0kHG}1$O{x0B*DS0)qqvcK~SsZnJ?0k5RoU3nKsk
+
+delta 31
+pcmV+)0O0?SvH_5?0kHG}1z`YY0C=<c0)qqvVE|?Tc(Z{Ak5Ri73k3iG
+
+diff --git a/WeaselTSF/WeaselTSF.rc b/WeaselTSF/WeaselTSF.rc
+index 3a7fba11a1ca7a94e42c894228d6b72962c03f8c..a0f4ec5f8cf891e3a882e872816e5f2a617a04c0 100644
+GIT binary patch
+delta 29
+ncmV+&0OJ4He%OAn3IYXp0BHbjvkwCM1_gHjX#j4s4+%*&o)ifl
+
+delta 29
+ncmV+&0OJ4He%OAn3IYXT0A>JqvkwCM1_faNW&n7z4+%*&oBs&_
+

@@ -55,6 +55,8 @@ Windows 默认用户目录为 `%APPDATA%\Rime`。自定义目录使用 `install-
 
 先配套构建并安装带补丁的小狼毫前端/服务端（见 [TSF 扩展](TSF.md)）；`install-rime` 不替换小狼毫二进制。
 
+若始终提示“未获取到局部上下文，保留原候选”，先执行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/doctor_tsf.ps1`，检查 Windows 实际注册的 TSF DLL 是否为补丁版本。[现成本机测试包的安装、回滚步骤](TSF.md#一直提示未获取到局部上下文)已提供；安装后需要重开测试应用。
+
 从旧版升级时运行 `install-rime --force`，然后在小狼毫菜单**重新部署**并重启 Smart IM 服务。安装会备份本项目旧文件；仅修改仓库或重启服务不会替换已安装的 Lua。
 
 ### GPU 与延迟排查

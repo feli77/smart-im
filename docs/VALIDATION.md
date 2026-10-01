@@ -1,5 +1,18 @@
 # 验证记录
 
+## 2026-10-01：持续缺少上下文的部署诊断与完整原生构建
+
+故障发生时，真实 Lua 与仓库一致、Smart IM 心跳正常，但运行中的 `WeaselServer.exe`、安装目录两种位数 TSF DLL、实际注册的 System32/SysWOW64 DLL 都没有原生上下文扩展。这解释了为什么每次输入都退回 `NO_CONTEXT`。检查只读取版本、特征标记、哈希与心跳，不读取用户正文。
+
+- 修复可选 input scope 属性返回 `S_FALSE`/`E_NOTIMPL` 时误拒绝普通正文的问题；安全标记、明确私密 scope 和其他读取故障继续拒绝。原生 COM 测试覆盖无属性、空属性、一般 scope、密码/PIN 和失败路径。
+- 完成 VS 2022 / MSVC 14.44、Windows SDK、Boost 1.84 静态库、官方 librime 1.17.0 导入库下的完整链接：64 位 `WeaselServer.exe`、64 位 `weaselx64.dll`、32 位 `weasel.dll`。修复完整链接暴露的 input-scope GUID 定义和资源头文件依赖问题。
+- `scripts/build_weasel_tsf.ps1` 实际运行成功，生成 `artifacts/weasel-tsf-0.17.4-test` 与 SHA256 清单。两种位数 DLL 分别在对应位数进程中 `LoadLibrary` 成功，四个 COM 导出存在；没有调用注册或激活。服务端所导入的 Rime、WinSparkle 接口均能在本机现有 DLL 找到，运行时 DLL 不随测试包替换。
+- 原生 parser **66 checks**、真实 named pipe **44 checks**、TSF COM 范围及输入域测试通过。在隔离的真实 Windows TSF manager / 自建 text store 中，支持 scope 的控件路径可进入同步 READ session，生产 helper 读取两侧正文成功，本方 READWRITE 通知可由 `InWriteSession` 识别。该探针未注册输入法，不代表真实应用键事件验收。
+- 原生四提交补丁在新的 0.17.4 worktree 使用 `git am --keep-cr` 重放成功，最终 tree 与开发分支一致：`6cb49e4c3b827588543df449218f033e9bc426f3`。
+- 诊断、构建和安装脚本均通过 Windows PowerShell 5.1 语法检查。安装脚本的真实包哈希、位数、特征标记检查通过；错误哈希和原版 DLL 被拒绝。非管理员执行在任何备份、停服或覆盖前拒绝，验证后原服务 PID 不变。安装和回滚代码已独立审查，尚未执行管理员安装或真实回滚。
+
+**待实际执行：** 管理员安装测试包、普通权限启动服务、重开应用，然后验证已有正文、组合/已选段去重，以及光标/焦点变化失效。步骤见 [安装与诊断](TSF.md#一直提示未获取到局部上下文)。本轮未修改 Python/Lua 业务代码，沿用下方 460 项测试结果；原生完整链接和安装仍是两个不同阶段。
+
 ## 2026-10-01：TSF 局部上下文重构
 
 本次以小狼毫官方 0.17.4 固定提交为基础开发，源码补丁与复现步骤见 [TSF 扩展](TSF.md)。测试未替换系统输入法，未修改实际 Rime 用户目录。
