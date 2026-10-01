@@ -22,9 +22,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_weasel_tsf.p
   -BackupDir "$env:LOCALAPPDATA\SmartIM\weasel-backup-$(Get-Date -Format yyyyMMdd-HHmmss)"
 ```
 
-脚本先完整备份本次涉及的文件和注册信息，再退出服务，覆盖三个原生文件，通过现有官方 `WeaselSetup.exe /s` 复制、注册两个系统 DLL，最后核对哈希和注册路径。它要求现有 `Hant=0`，会重新启用简体输入 profile；不部署词库，不从管理员会话启动服务。记下输出的备份路径。
+脚本先完整备份本次涉及的文件和注册信息，再退出服务，更新三个安装目录文件和两个系统 DLL，最后核对哈希和注册路径。它要求现有 `Hant=0`，且两种位数的 COM 注册已指向对应系统路径。补丁没有改变 CLSID、profile、categories 或注册实现，因此更新沿用现有注册，不再调用 `WeaselSetup`。它不部署词库、不修改输入 profile、不从管理员会话启动服务。记下输出的备份路径。
 
-如果旧版脚本一直停在 `Installing:`，先按 Ctrl+C，并关闭旧安装终端，再从新的管理员终端运行上面的命令，使用新的备份目录。旧版对 `WeaselServer.exe /q` 使用无限等待，原版小狼毫的同步 IPC 可能令该退出进程一直不返回。修复后的脚本显示四个阶段：退出请求最多等待 10 秒，再给服务 10 秒完成保存；残留进程只有在路径、Windows 会话核对后才停止，确认全部退出后才复制。注册步骤最多等待 60 秒，超时报告具体阶段并保留备份。不要让旧、新安装脚本同时运行。
+脚本显示四个阶段：退出服务、更新安装目录、更新系统 DLL、校验。退出请求最多等待 10 秒，再给服务 10 秒完成保存；残留进程只有在路径、Windows 会话核对后才停止，确认全部退出后才更新。系统 DLL 先复制到同目录临时文件并校验，再将旧文件重命名、换入新版；失败时恢复旧文件。仍被应用加载的旧 DLL 可保留到重启清理。
+
+旧版脚本曾在 `WeaselServer.exe /q` 无限等待；之后加入超时的版本又遇到官方 `WeaselSetup /s` 超时。若已经更新安装目录，但系统 DLL 仍旧，不要另建备份重跑普通安装：先确认旧安装进程已退出，再用原备份继续。以本机此次备份为例：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_weasel_tsf.ps1 `
+  -Resume -PackageDir artifacts/weasel-tsf-0.17.4-test `
+  -BackupDir "$env:LOCALAPPDATA\SmartIM\weasel-backup-20261001-155910"
+```
+
+`-Resume` 会检查原备份完整性、目标包和五个当前文件，只接受原版或目标版本的已知哈希；未知改动会停止，不覆盖。不要让旧、新安装脚本同时运行。阶段和错误写入原备份目录的 `install.log`；传统控制台选取文字可能暂停输出，此时按 Esc 解除，不必继续等待。
 
 安装完成后关闭管理员终端，在**普通 PowerShell** 中执行：
 
@@ -43,7 +53,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_weasel_tsf.p
   -Rollback -BackupDir '实际备份路径'
 ```
 
-随后同样从普通终端启动服务并重开应用。回滚只恢复本次原生文件并用原安装器登记，不导入整棵用户输入法注册树。回到原版原生组件后，新 Lua 会恢复“未获取到局部上下文”的降级行为。
+随后同样从普通终端启动服务并重开应用。回滚恢复安装目录和系统目录的原生文件，沿用已核对的现有注册，不导入整棵用户输入法注册树。回到原版原生组件后，新 Lua 会恢复“未获取到局部上下文”的降级行为。
 
 ## 小狼毫源码与补丁
 

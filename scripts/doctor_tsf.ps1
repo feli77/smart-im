@@ -199,7 +199,7 @@ try {
 $nativeVerified = $checks.Count -ge 5 -and @($checks | Where-Object { -not $_.Verified }).Count -eq 0
 if (-not $nativeVerified) {
     Write-Output "RESULT: the complete patched native TSF/server installation is NOT verified."
-    Write-Output "Updating smart_im.lua alone cannot supply TSF context. Install the matching patched WeaselServer.exe plus BOTH x64/x86 TSF DLLs; use the matching WeaselSetup.exe to copy/register system TSF DLLs. Back up the current installation first."
+    Write-Output "Updating smart_im.lua alone cannot supply TSF context. Use install_weasel_tsf.ps1 for the matching server and BOTH system TSF DLLs; use -Resume with the original backup if a previous installation stopped after copying files."
     Write-Output "After installation, restart the server and the applications that loaded the old TSF DLL (sign out/in if needed), then rerun this script. This script performs no installation or restart."
 } else {
     Write-Output "Native binaries have Smart IM evidence. This does not prove a particular editor supports TSF surrounding text."

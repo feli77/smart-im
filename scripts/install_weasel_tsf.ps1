@@ -1,29 +1,34 @@
 <#
 .SYNOPSIS
-Install or roll back the three tested Smart IM Weasel native binaries.
+Install, resume or roll back the tested Smart IM Weasel native binaries.
 .DESCRIPTION
 Run explicitly from an administrator, 64-bit PowerShell on x64 Windows.
 Supports an existing simplified-Chinese (Hant=0) Weasel installation only.
 The package manifest.json must contain files mapping the three fixed filenames
 to their SHA256 hashes. Backups are completed before the server is stopped.
-The existing official WeaselSetup.exe /s copies/registers both system TSF DLLs.
+The existing TSF CLSID and registered paths must already be correct. This
+binary-only update replaces the two system DLLs without rerunning WeaselSetup.
 No user dictionary, Lua file, startup entry or user-directory setting is changed.
-Setup re-enables the existing simplified-Chinese Windows input profile. Registry
-exports are recovery evidence; rollback never overwrites entire user CTF trees.
+Registry exports are recovery evidence; no input profile is re-registered.
 The server remains stopped so it can be restarted from a normal user session.
 .EXAMPLE
 .\scripts\install_weasel_tsf.ps1 -PackageDir C:\tested-package -BackupDir C:\weasel-backup-unique
 .EXAMPLE
 .\scripts\install_weasel_tsf.ps1 -Rollback -BackupDir C:\weasel-backup-unique
+.EXAMPLE
+.\scripts\install_weasel_tsf.ps1 -Resume -PackageDir C:\tested-package -BackupDir C:\weasel-backup-unique
 #>
 [CmdletBinding(DefaultParameterSetName = "Install")]
 param(
     [Parameter(Mandatory = $true, ParameterSetName = "Install")]
+    [Parameter(Mandatory = $true, ParameterSetName = "Resume")]
     [string]$PackageDir,
     [Parameter(Mandatory = $true)]
     [string]$BackupDir,
     [Parameter(Mandatory = $true, ParameterSetName = "Rollback")]
-    [switch]$Rollback
+    [switch]$Rollback,
+    [Parameter(Mandatory = $true, ParameterSetName = "Resume")]
+    [switch]$Resume
 )
 
 $ErrorActionPreference = "Stop"
@@ -55,6 +60,16 @@ function Hash-File {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
 
+function Write-InstallStatus {
+    param([string]$Message)
+    # Persist progress before console output, which classic QuickEdit can pause.
+    if ($script:InstallerLogPath) {
+        [IO.File]::AppendAllText($script:InstallerLogPath,
+            ([DateTimeOffset]::Now.ToString("o") + " " + $Message + [Environment]::NewLine))
+    }
+    Write-Host $Message
+}
+
 function Check-Hash {
     param([string]$Path, [string]$Expected)
     if ($Expected -notmatch '^[0-9a-fA-F]{64}$' -or (Hash-File $Path) -ne $Expected) {
@@ -83,6 +98,63 @@ function Check-PackageBinary {
     if (-not $marked) { throw "Required Smart IM native feature marker is missing: $Name" }
 }
 
+function Read-VerifiedPackage {
+    param([string]$SourceDir)
+    $package = Get-Content -LiteralPath (Join-Path $SourceDir "manifest.json") -Raw | ConvertFrom-Json
+    if (@($package.files.PSObject.Properties).Count -ne 3) {
+        throw "Package must declare exactly the three native files."
+    }
+    foreach ($name in @("WeaselServer.exe", "weaselx64.dll", "weasel.dll")) {
+        Check-Hash (Join-Path $SourceDir $name) $package.files.$name
+        Check-PackageBinary (Join-Path $SourceDir $name) $name
+    }
+    return $package
+}
+
+function Read-VerifiedBackup {
+    param([string]$Directory, [string]$InstallRoot, [string]$SetupPath)
+    $saved = Get-Content -LiteralPath (Join-Path $Directory "backup.json") -Raw | ConvertFrom-Json
+    if ($saved.kind -ne "smart-im-weasel-tsf-backup" -or $saved.version -ne 1 -or
+        $saved.complete -isnot [bool] -or $saved.complete -ne $true -or
+        $saved.install_root -ne $InstallRoot -or $saved.hant -ne 0) {
+        throw "Backup is incomplete or belongs to a different installation."
+    }
+    if (@($saved.files.PSObject.Properties).Count -ne 3 -or
+        @($saved.system_files.PSObject.Properties).Count -ne 2) {
+        throw "Backup must declare exactly three installed files and two system DLLs."
+    }
+    Check-Hash $SetupPath $saved.setup_sha256
+    Check-Hash (Join-Path $Directory "WeaselSetup.exe") $saved.setup_sha256
+    foreach ($name in @("WeaselServer.exe", "weaselx64.dll", "weasel.dll")) {
+        Check-Hash (Join-Path (Join-Path $Directory "installed") $name) $saved.files.$name
+    }
+    foreach ($name in @("weaselx64.dll", "weasel.dll")) {
+        Check-Hash (Join-Path (Join-Path $Directory "system") $name) $saved.system_files.$name
+        if ($saved.system_files.$name -ne $saved.files.$name) {
+            throw "Original system DLLs differ from source DLLs; this backup requires manual recovery."
+        }
+    }
+    return $saved
+}
+
+function Check-ResumeState {
+    param([string]$InstallRoot, [hashtable]$SystemDlls, $OriginalHashes, $TargetHashes)
+    foreach ($name in @("WeaselServer.exe", "weaselx64.dll", "weasel.dll")) {
+        $path = Join-Path $InstallRoot $name
+        $currentHash = Hash-File $path
+        if ($currentHash -ne $OriginalHashes.$name -and $currentHash -ne $TargetHashes.$name) {
+            throw "Resume refused: installed file is neither the backed-up original nor the verified package: $path"
+        }
+    }
+    foreach ($name in @("weaselx64.dll", "weasel.dll")) {
+        $path = $SystemDlls[$name]
+        $currentHash = Hash-File $path
+        if ($currentHash -ne $OriginalHashes.$name -and $currentHash -ne $TargetHashes.$name) {
+            throw "Resume refused: system DLL is neither the backed-up original nor the verified package: $path"
+        }
+    }
+}
+
 function Invoke-InstallerProcess {
     param([string]$FilePath, [string[]]$ArgumentList,
           [int]$TimeoutSeconds, [string]$Stage)
@@ -98,8 +170,8 @@ function Invoke-InstallerProcess {
             -WindowStyle Hidden -PassThru
         $null = $process.Handle
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            # Also cover regsvr32 children started by WeaselSetup. Only target
-            # this invocation's still-running process and its descendants.
+            # Only target this invocation's still-running process and its
+            # descendants; never terminate processes by executable name.
             if (-not $process.HasExited) {
                 $terminator = Start-Process -FilePath (Join-Path $env:WINDIR "System32\taskkill.exe") `
                     -ArgumentList @("/PID", [string]$process.Id, "/T", "/F") -WindowStyle Hidden -PassThru
@@ -141,10 +213,10 @@ function Get-InstalledServerProcess {
 function Stop-InstalledServer {
     param([string]$ServerPath)
     if (@(Get-InstalledServerProcess $ServerPath).Count -eq 0) {
-        Write-Output "[1/4] No running WeaselServer; skipping /q."
+        Write-InstallStatus "[1/4] No running WeaselServer; skipping /q."
         return
     }
-    Write-Output "[1/4] Requesting WeaselServer shutdown (maximum 10 seconds)..."
+    Write-InstallStatus "[1/4] Requesting WeaselServer shutdown (maximum 10 seconds)..."
     try {
         $quitCode = Invoke-InstallerProcess -FilePath $ServerPath -ArgumentList @("/q") `
             -TimeoutSeconds 10 -Stage "WeaselServer /q"
@@ -154,7 +226,7 @@ function Stop-InstalledServer {
     }
     # The shutdown reply precedes the server's dictionary finalization. Give
     # it a separate, bounded grace period before considering a forced stop.
-    Write-Output "[1/4] Waiting up to 10 seconds for server finalization..."
+    Write-InstallStatus "[1/4] Waiting up to 10 seconds for server finalization..."
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         if (@(Get-InstalledServerProcess $ServerPath).Count -eq 0) { return }
@@ -176,6 +248,103 @@ function Stop-InstalledServer {
     }
 }
 
+function Set-TsfSystemBinary {
+    param([string]$Source, [string]$Destination, [string]$ExpectedHash)
+    $sourcePath = [IO.Path]::GetFullPath($Source)
+    $destinationPath = [IO.Path]::GetFullPath($Destination)
+    if ($sourcePath -eq $destinationPath) {
+        throw "Source and destination must be different files."
+    }
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $destinationPath -PathType Leaf)) {
+        throw "Both the source and existing TSF destination must be files."
+    }
+    Check-Hash $sourcePath $ExpectedHash
+    if ((Hash-File $destinationPath) -eq $ExpectedHash) {
+        return [pscustomobject]@{ Destination = $destinationPath; Changed = $false;
+            RetainedOldPath = $null; CleanupAtReboot = $false }
+    }
+
+    $suffix = [guid]::NewGuid().ToString("N")
+    $stagePath = "$destinationPath.smart-im-stage-$suffix"
+    $oldPath = "$destinationPath.smart-im-old-$suffix"
+    $oldHash = Hash-File $destinationPath
+    $oldMoved = $false
+    $newMoved = $false
+    try {
+        # Complete and verify the copy before touching the registered DLL.
+        # A loaded Windows image can be renamed even when it cannot be
+        # overwritten. Both renames stay on the destination's volume.
+        Copy-Item -LiteralPath $sourcePath -Destination $stagePath -ErrorAction Stop
+        Check-Hash $stagePath $ExpectedHash
+        Move-Item -LiteralPath $destinationPath -Destination $oldPath -ErrorAction Stop
+        $oldMoved = $true
+        Move-Item -LiteralPath $stagePath -Destination $destinationPath -ErrorAction Stop
+        $newMoved = $true
+        Check-Hash $destinationPath $ExpectedHash
+    } catch {
+        $replaceFailure = $_.Exception.Message
+        if ($oldMoved) {
+            try {
+                if ($newMoved) {
+                    # The new DLL may already be loaded by another process.
+                    # Rename it aside before restoring the original as well.
+                    Move-Item -LiteralPath $destinationPath -Destination $stagePath -ErrorAction Stop
+                }
+                Move-Item -LiteralPath $oldPath -Destination $destinationPath -ErrorAction Stop
+                $oldMoved = $false
+                Check-Hash $destinationPath $oldHash
+            } catch {
+                throw "TSF replacement failed ($replaceFailure); restoring $destinationPath also failed: $($_.Exception.Message). Preserve $oldPath and the installation backup for recovery."
+            }
+        }
+        throw "TSF replacement failed; the original destination was preserved: $replaceFailure"
+    } finally {
+        if (Test-Path -LiteralPath $stagePath -PathType Leaf) {
+            try { Remove-Item -LiteralPath $stagePath -Force -ErrorAction Stop }
+            catch { Write-Warning "Could not remove staged file: $stagePath" }
+        }
+    }
+
+    $retainedOldPath = $null
+    $cleanupAtReboot = $false
+    try { Remove-Item -LiteralPath $oldPath -Force -ErrorAction Stop }
+    catch {
+        $retainedOldPath = $oldPath
+        # Cleanup must not turn a verified replacement into an install failure.
+        # MOVEFILE_DELAY_UNTIL_REBOOT requires administrator privileges.
+        try {
+            $cleanupIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            try {
+                $cleanupPrincipal = New-Object Security.Principal.WindowsPrincipal($cleanupIdentity)
+                $isAdministrator = $cleanupPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            } finally { $cleanupIdentity.Dispose() }
+            if ($isAdministrator) {
+                if (-not ("SmartIM.NativeFileCleanup" -as [type])) {
+                    Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+namespace SmartIM {
+    public static class NativeFileCleanup {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool MoveFileExW(string existingPath, string newPath, uint flags);
+    }
+}
+'@
+                }
+                $cleanupAtReboot = [SmartIM.NativeFileCleanup]::MoveFileExW($oldPath, $null, 4)
+            }
+        } catch { Write-Warning "Could not schedule old DLL cleanup: $($_.Exception.Message)" }
+        if ($cleanupAtReboot) {
+            Write-Warning "The previous loaded DLL will be removed at reboot: $oldPath"
+        } else {
+            Write-Warning "The previous DLL remains at $oldPath; remove it after applications exit or Windows restarts."
+        }
+    }
+    return [pscustomobject]@{ Destination = $destinationPath; Changed = $true;
+        RetainedOldPath = $retainedOldPath; CleanupAtReboot = $cleanupAtReboot }
+}
+
 function Read-WerValues {
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey("LocalMachine", "Registry64")
     $key = $base.OpenSubKey($werKey, $false)
@@ -191,26 +360,6 @@ function Read-WerValues {
             [pscustomobject]@{ Name = $name; Present = [bool]$present; Kind = $kind; Value = $value }
         }
     } finally { if ($key) { $key.Dispose() }; $base.Dispose() }
-}
-
-function Restore-WerValues {
-    param($Values)
-    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey("LocalMachine", "Registry64")
-    $key = $base.CreateSubKey($werKey)
-    try {
-        foreach ($item in $Values) {
-            if ($item.Name -notin @("DumpFolder", "DumpType", "CustomDumpFlags", "DumpCount")) {
-                throw "Unexpected WER value in backup."
-            }
-            if ($item.Present) {
-                $value = $item.Value
-                if ($item.Kind -eq "DWord") { $value = [int]$value }
-                $key.SetValue($item.Name, $value, [Microsoft.Win32.RegistryValueKind]$item.Kind)
-            } else {
-                $key.DeleteValue($item.Name, $false)
-            }
-        }
-    } finally { $key.Dispose(); $base.Dispose() }
 }
 
 $installRoot = [string](Read-Reg LocalMachine Registry32 "Software\Rime\Weasel" "WeaselRoot")
@@ -240,9 +389,8 @@ foreach ($architecture in @("x64", "x86")) {
     $view = if ($architecture -eq "x64") { "Registry64" } else { "Registry32" }
     $name = if ($architecture -eq "x64") { "weaselx64.dll" } else { "weasel.dll" }
     $registered = [string](Read-Reg ClassesRoot $view $classKey "")
-    if (-not $Rollback -and
-        (-not $registered -or [IO.Path]::GetFullPath($registered) -ne $systemDlls[$name])) {
-        throw "Unexpected registered $architecture TSF path. Inspect doctor_tsf.ps1 before installing."
+    if (-not $registered -or [IO.Path]::GetFullPath($registered) -ne $systemDlls[$name]) {
+        throw "Unexpected registered $architecture TSF path. This binary-only updater requires valid existing registration."
     }
 }
 $BackupDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BackupDir)
@@ -251,29 +399,18 @@ $server = Join-Path $installRoot "WeaselServer.exe"
 $null = @(Get-InstalledServerProcess $server)
 
 if ($Rollback) {
-    $saved = Get-Content -LiteralPath $backupManifest -Raw | ConvertFrom-Json
-    if ($saved.kind -ne "smart-im-weasel-tsf-backup" -or $saved.version -ne 1 -or
-        -not $saved.complete -or $saved.install_root -ne $installRoot -or $saved.hant -ne 0) {
-        throw "Backup is incomplete or belongs to a different installation."
-    }
-    Check-Hash $setup $saved.setup_sha256
+    $saved = Read-VerifiedBackup $BackupDir $installRoot $setup
     $sourceDir = Join-Path $BackupDir "installed"
-    foreach ($name in $names) { Check-Hash (Join-Path $sourceDir $name) $saved.files.$name }
-    foreach ($name in $systemDlls.Keys) {
-        Check-Hash (Join-Path (Join-Path $BackupDir "system") $name) $saved.system_files.$name
-        if ($saved.system_files.$name -ne $saved.files.$name) {
-            throw "Original system DLLs differ from source DLLs; this backup requires manual recovery."
-        }
-    }
     $targetHashes = $saved.files
+} elseif ($Resume) {
+    $saved = Read-VerifiedBackup $BackupDir $installRoot $setup
+    $sourceDir = (Resolve-Path -LiteralPath $PackageDir).Path
+    $package = Read-VerifiedPackage $sourceDir
+    $targetHashes = $package.files
+    Check-ResumeState $installRoot $systemDlls $saved.files $targetHashes
 } else {
     $sourceDir = (Resolve-Path -LiteralPath $PackageDir).Path
-    $package = Get-Content -LiteralPath (Join-Path $sourceDir "manifest.json") -Raw | ConvertFrom-Json
-    if (@($package.files.PSObject.Properties).Count -ne 3) { throw "Package must declare exactly the three native files." }
-    foreach ($name in $names) {
-        Check-Hash (Join-Path $sourceDir $name) $package.files.$name
-        Check-PackageBinary (Join-Path $sourceDir $name) $name
-    }
+    $package = Read-VerifiedPackage $sourceDir
     if (Test-Path -LiteralPath $BackupDir) { throw "BackupDir must not already exist. Choose a unique persistent directory." }
     $userDir = [string](Read-Reg CurrentUser Registry32 "Software\Rime\Weasel" "RimeUserDir")
     if (-not $userDir) { $userDir = Join-Path $env:APPDATA "Rime" }
@@ -344,36 +481,27 @@ if ($Rollback) {
     $targetHashes = $package.files
 }
 
-# Restrict automatic restoration to the four known values and their documented
-# types, before stopping the server or replacing any installed file.
-if (@($saved.wer_values).Count -ne 4) { throw "Invalid WER backup value count." }
-foreach ($item in $saved.wer_values) {
-    $validKinds = if ($item.Name -eq "DumpFolder") { @("String", "ExpandString") } else { @("DWord") }
-    if ($item.Name -notin @("DumpFolder", "DumpType", "CustomDumpFlags", "DumpCount") -or
-        ($item.Present -and $item.Kind -notin $validKinds)) {
-        throw "Unexpected WER backup value/type; use a reviewed manual recovery plan."
-    }
-}
-
-Write-Output ("Backup ready: {0}" -f $BackupDir)
-Write-Output ("{0}: {1}" -f $(if ($Rollback) { "Rolling back" } else { "Installing" }), $installRoot)
+$script:InstallerLogPath = Join-Path $BackupDir "install.log"
+Write-InstallStatus ("Backup ready: {0}" -f $BackupDir)
+Write-InstallStatus ("{0}: {1}" -f $(if ($Rollback) { "Rolling back" } elseif ($Resume) { "Resuming" } else { "Installing" }), $installRoot)
 try {
     Stop-InstalledServer $server
-    Write-Output "[2/4] Copying the three native binaries..."
+    Write-InstallStatus "[2/4] Copying the three native binaries..."
     foreach ($name in $names) {
         Check-Hash (Join-Path $sourceDir $name) $targetHashes.$name
         Copy-Item -LiteralPath (Join-Path $sourceDir $name) -Destination (Join-Path $installRoot $name) -Force
     }
-    Write-Output "[3/4] Registering both TSF DLLs (maximum 60 seconds)..."
-    try {
-        $setupCode = Invoke-InstallerProcess -FilePath $setup -ArgumentList @("/s") `
-            -TimeoutSeconds 60 -Stage "WeaselSetup /s"
-    } finally {
-        # Preserve unrelated WER values even when setup fails or times out.
-        Restore-WerValues $saved.wer_values
+    Write-InstallStatus "[3/4] Updating system DLLs at their existing registered paths..."
+    foreach ($name in @("weasel.dll", "weaselx64.dll")) {
+        Write-InstallStatus ("Updating {0}" -f $systemDlls[$name])
+        $replacement = Set-TsfSystemBinary -Source (Join-Path $sourceDir $name) `
+            -Destination $systemDlls[$name] -ExpectedHash $targetHashes.$name
+        Write-InstallStatus ("Verified {0}" -f $systemDlls[$name])
+        if ($replacement.RetainedOldPath) {
+            Write-InstallStatus ("Previous DLL: {0}; cleanup at reboot: {1}" -f $replacement.RetainedOldPath, $replacement.CleanupAtReboot)
+        }
     }
-    if ($setupCode -ne 0) { throw "WeaselSetup failed with exit code $setupCode." }
-    Write-Output "[4/4] Verifying installed files and both TSF registrations..."
+    Write-InstallStatus "[4/4] Verifying installed files and existing TSF registrations..."
     foreach ($name in $names) { Check-Hash (Join-Path $installRoot $name) $targetHashes.$name }
     foreach ($name in $systemDlls.Keys) { Check-Hash $systemDlls[$name] $targetHashes.$name }
     foreach ($architecture in @("x64", "x86")) {
@@ -384,11 +512,12 @@ try {
         }
     }
 } catch {
-    Write-Output "Native installation/rollback did not complete; the persistent backup has been kept."
-    Write-Output ("Recovery command: & '{0}' -Rollback -BackupDir '{1}'" -f $PSCommandPath.Replace("'", "''"), $BackupDir.Replace("'", "''"))
+    Write-InstallStatus ("ERROR: " + $_.Exception.Message)
+    Write-InstallStatus "Native update did not complete; the persistent backup has been kept."
+    Write-InstallStatus ("Recovery command: & '{0}' -Rollback -BackupDir '{1}'" -f $PSCommandPath.Replace("'", "''"), $BackupDir.Replace("'", "''"))
     throw
 }
-Write-Output "Native files and both system DLL hashes/registration paths verified."
+Write-InstallStatus "Native files and both system DLL hashes/registration paths verified."
 Write-Output "Close and reopen applications that loaded the old TSF DLL. Save work before signing out/in if needed."
 Write-Output "Open a NORMAL (non-administrator) PowerShell window and start the server there:"
 Write-Output ("Start-Process -FilePath '{0}' -WindowStyle Hidden" -f $server.Replace("'", "''"))
