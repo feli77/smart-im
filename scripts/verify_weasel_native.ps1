@@ -69,6 +69,20 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Smart IM TSF range native compilation failed." }
     & $localContextBinary
     if ($LASTEXITCODE -ne 0) { throw "Smart IM TSF range native tests failed." }
+    # The same regression runs as x64 by default, or x86 when -VcVarsPath
+    # points to vcvars32.bat. Keep both binaries for runtime diagnosis.
+    $realTsfArchitecture = $env:VSCMD_ARG_TGT_ARCH
+    $realTsfBinary = Join-Path $outputRoot "RealTsfContextTest-$realTsfArchitecture.exe"
+    $realTsfArgs = @(
+        "/nologo", "/std:c++17", "/EHsc", "/W3", "/utf-8", "/DUNICODE", "/D_UNICODE",
+        "/Fo$(Join-Path $outputRoot "RealTsfContextTest-$realTsfArchitecture.obj")", "/Fe$realTsfBinary",
+        (Join-Path $WeaselRoot "WeaselTSF\tests\RealTsfContextTest.cpp"),
+        "/link", "ole32.lib", "oleaut32.lib", "uuid.lib"
+    )
+    & cl.exe @realTsfArgs
+    if ($LASTEXITCODE -ne 0) { throw "Real Windows TSF $realTsfArchitecture regression compilation failed." }
+    & $realTsfBinary
+    if ($LASTEXITCODE -ne 0) { throw "Real Windows TSF $realTsfArchitecture regression tests failed." }
     if ($BoostRoot) {
         $pipeSource = Join-Path $WeaselRoot "test\SmartIMPipeTest.cpp"
         $pipeImplementation = Join-Path $WeaselRoot "WeaselIPC\PipeChannel.cpp"

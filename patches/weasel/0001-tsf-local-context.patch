@@ -1,7 +1,7 @@
 From a89a78e8d44af3bb793c17cab045cd437f35f0c8 Mon Sep 17 00:00:00 2001
 From: felix07 <l.shuheng@stu.xjtu.edu.cn>
 Date: Thu, 1 Oct 2026 13:13:12 +0800
-Subject: [PATCH 1/4] feat(tsf): publish local document context for Smart IM
+Subject: [PATCH 1/9] feat(tsf): publish local document context for Smart IM
 
 ---
  RimeWithWeasel/RimeWithWeasel.cpp    |  25 +++
@@ -1906,7 +1906,7 @@ index 0000000..ce4157f
 From 05f44708bb49390626064bbd346b448c4f2906d1 Mon Sep 17 00:00:00 2001
 From: felix07 <l.shuheng@stu.xjtu.edu.cn>
 Date: Thu, 1 Oct 2026 15:31:52 +0800
-Subject: [PATCH 2/4] fix(tsf): handle absent input scope properties
+Subject: [PATCH 2/9] fix(tsf): handle absent input scope properties
 
 ---
  WeaselTSF/LocalContext.cpp           |  44 +---------
@@ -2194,7 +2194,7 @@ index 183346c..cdef513 100644
 From 846294e8fbdd8a7d04e9d130ebf607bf4d474420 Mon Sep 17 00:00:00 2001
 From: felix07 <l.shuheng@stu.xjtu.edu.cn>
 Date: Thu, 1 Oct 2026 15:33:52 +0800
-Subject: [PATCH 3/4] chore(tsf): identify context builds in version resources
+Subject: [PATCH 3/9] chore(tsf): identify context builds in version resources
 
 ---
  WeaselTSF/WeaselTSF.rc | Bin 15922 -> 16216 bytes
@@ -2216,7 +2216,7 @@ ocmV+(0O9}GezJV9{wT9xDb@p%U@0!M#x33hlVB+%vnnz!4d^Wl%K!iX
 From 407edb7620de82b8882c91dcf810aa5c22a7f866 Mon Sep 17 00:00:00 2001
 From: felix07 <l.shuheng@stu.xjtu.edu.cn>
 Date: Thu, 1 Oct 2026 15:36:36 +0800
-Subject: [PATCH 4/4] build(windows): use SDK resource headers for TSF test
+Subject: [PATCH 4/9] build(windows): use SDK resource headers for TSF test
  builds
 
 ---
@@ -2242,3 +2242,1096 @@ ncmV+&0OJ4He%OAn3IYXp0BHbjvkwCM1_gHjX#j4s4+%*&o)ifl
 delta 29
 ncmV+&0OJ4He%OAn3IYXT0A>JqvkwCM1_faNW&n7z4+%*&oBs&_
 
+
+From c9884ab55c11a7355473d4bda130b875913c1d41 Mon Sep 17 00:00:00 2001
+From: felix07 <l.shuheng@stu.xjtu.edu.cn>
+Date: Thu, 1 Oct 2026 17:01:41 +0800
+Subject: [PATCH 5/9] fix(tsf): accept absent optional input scope from Windows
+
+---
+ WeaselTSF/LocalContext.h               |  56 +++--
+ WeaselTSF/tests/LocalContextTest.cpp   |  69 ++++--
+ WeaselTSF/tests/RealTsfContextTest.cpp | 331 +++++++++++++++++++++++++
+ 3 files changed, 425 insertions(+), 31 deletions(-)
+ create mode 100644 WeaselTSF/tests/RealTsfContextTest.cpp
+
+diff --git a/WeaselTSF/LocalContext.h b/WeaselTSF/LocalContext.h
+index b57eb68..9861b79 100644
+--- a/WeaselTSF/LocalContext.h
++++ b/WeaselTSF/LocalContext.h
+@@ -80,33 +80,57 @@ inline bool Utf8Hex(const std::wstring& text, std::wstring& result) {
+ 
+ // Missing optional input scopes are not password markers. Secure mode and
+ // disabled input are checked by the caller before accessing document text.
+-inline bool AllowsContext(ITfContext* context, TfEditCookie ec, ITfRange* selection) {
++// The optional diagnostic distinguishes no scope hint (S_FALSE), a permitted
++// scope (S_OK), sensitive scope (E_ACCESSDENIED), and an actual API failure.
++inline bool AllowsContext(ITfContext* context,
++                          TfEditCookie ec,
++                          ITfRange* selection,
++                          HRESULT* reason = nullptr) {
++  const auto finish = [reason](HRESULT result) {
++    if (reason)
++      *reason = result;
++    return SUCCEEDED(result);
++  };
++  if (!context)
++    return finish(E_INVALIDARG);
+   CComPtr<ITfReadOnlyProperty> property;
+   const HRESULT propertyResult = context->GetAppProperty(GUID_PROP_INPUTSCOPE, &property);
+   // TSF documents S_FALSE for an unsupported property and E_NOTIMPL for an
+   // owner without application properties. Both mean there is no scope hint.
+   if (propertyResult == S_FALSE || propertyResult == E_NOTIMPL)
+-    return true;
+-  if (FAILED(propertyResult) || !property)
+-    return false;
++    return finish(S_FALSE);
++  if (FAILED(propertyResult))
++    return finish(propertyResult);
++  if (!property)
++    return finish(E_UNEXPECTED);
+   CComVariant value;
+-  if (FAILED(property->GetValue(ec, selection, &value)))
+-    return false;
++  const HRESULT valueResult = property->GetValue(ec, selection, &value);
++  // Windows also returns E_FAIL/VT_EMPTY when an ITextStoreACP supplies no
++  // optional scope attribute. Keep this compatibility case narrow: lock,
++  // disconnection and other errors, or a nonempty failed value, still reject.
++  if (valueResult == E_FAIL && value.vt == VT_EMPTY)
++    return finish(S_FALSE);
++  if (FAILED(valueResult))
++    return finish(valueResult);
+   if (value.vt == VT_EMPTY)
+-    return true;
++    return finish(S_FALSE);
+   if (value.vt != VT_UNKNOWN || !value.punkVal)
+-    return false;
++    return finish(E_UNEXPECTED);
+   CComPtr<ITfInputScope> scope;
+-  if (FAILED(value.punkVal->QueryInterface(IID_PPV_ARGS(&scope))))
+-    return false;
++  const HRESULT scopeResult = value.punkVal->QueryInterface(IID_PPV_ARGS(&scope));
++  if (FAILED(scopeResult))
++    return finish(scopeResult);
++  if (!scope)
++    return finish(E_UNEXPECTED);
+   InputScope* scopes = nullptr;
+   UINT count = 0;
+-  if (FAILED(scope->GetInputScopes(&scopes, &count))) {
++  const HRESULT inputResult = scope->GetInputScopes(&scopes, &count);
++  if (FAILED(inputResult)) {
+     CoTaskMemFree(scopes);
+-    return false;
++    return finish(inputResult);
+   }
+-  bool allowed = count == 0 || scopes != nullptr;
+-  for (UINT i = 0; allowed && i < count; ++i) {
++  HRESULT result = count == 0 ? S_FALSE : (scopes ? S_OK : E_UNEXPECTED);
++  for (UINT i = 0; SUCCEEDED(result) && i < count; ++i) {
+     switch (scopes[i]) {
+       case IS_PASSWORD:
+       case IS_PRIVATE:
+@@ -114,14 +138,14 @@ inline bool AllowsContext(ITfContext* context, TfEditCookie ec, ITfRange* select
+       case IS_NUMERIC_PIN:
+       case IS_ALPHANUMERIC_PIN:
+       case IS_ALPHANUMERIC_PIN_SET:
+-        allowed = false;
++        result = E_ACCESSDENIED;
+         break;
+       default:
+         break;
+     }
+   }
+   CoTaskMemFree(scopes);
+-  return allowed;
++  return finish(result);
+ }
+ 
+ }  // namespace smart_im
+diff --git a/WeaselTSF/tests/LocalContextTest.cpp b/WeaselTSF/tests/LocalContextTest.cpp
+index cdef513..a5ca0b5 100644
+--- a/WeaselTSF/tests/LocalContextTest.cpp
++++ b/WeaselTSF/tests/LocalContextTest.cpp
+@@ -139,6 +139,7 @@ class ComFixture : public Interface {
+  public:
+   STDMETHODIMP QueryInterface(REFIID iid, void** out) override {
+     *out = nullptr;
++    if (FAILED(queryResult)) return queryResult;
+     if (iid != IID_IUnknown && iid != __uuidof(Interface)) return E_NOINTERFACE;
+     *out = static_cast<Interface*>(this);
+     AddRef();
+@@ -147,6 +148,7 @@ class ComFixture : public Interface {
+   STDMETHODIMP_(ULONG) AddRef() override { return ++references; }
+   STDMETHODIMP_(ULONG) Release() override { return --references; }
+   ULONG references = 1;
++  HRESULT queryResult = S_OK;
+ };
+ 
+ #define UNUSED_METHOD(name, args) STDMETHODIMP name args override { return E_NOTIMPL; }
+@@ -155,10 +157,14 @@ class ScopeFixture : public ComFixture<ITfInputScope> {
+  public:
+   InputScope scope = IS_DEFAULT;
+   HRESULT result = S_OK;
++  UINT scopeCount = 1;
++  bool missingArray = false;
+   STDMETHODIMP GetInputScopes(InputScope** scopes, UINT* count) override {
+     *scopes = nullptr;
+     *count = 0;
+     if (FAILED(result)) return result;
++    *count = scopeCount;
++    if (missingArray || !scopeCount) return result;
+     *scopes = static_cast<InputScope*>(CoTaskMemAlloc(sizeof(InputScope)));
+     if (!*scopes) return E_OUTOFMEMORY;
+     **scopes = scope;
+@@ -175,13 +181,13 @@ class PropertyFixture : public ComFixture<ITfReadOnlyProperty> {
+  public:
+   ScopeFixture scope;
+   VARTYPE type = VT_EMPTY;
++  bool nullUnknown = false;
+   HRESULT result = S_OK;
+   STDMETHODIMP GetValue(TfEditCookie ec, ITfRange*, VARIANT* value) override {
+     assert(ec == 42);
+     VariantInit(value);
+-    if (FAILED(result)) return result;
+     value->vt = type;
+-    if (type == VT_UNKNOWN) {
++    if (type == VT_UNKNOWN && !nullUnknown) {
+       value->punkVal = &scope;
+       scope.AddRef();
+     }
+@@ -195,11 +201,12 @@ class PropertyFixture : public ComFixture<ITfReadOnlyProperty> {
+ class ContextFixture : public ComFixture<ITfContext> {
+  public:
+   HRESULT result = S_FALSE;
++  bool nullProperty = false;
+   PropertyFixture property;
+   STDMETHODIMP GetAppProperty(REFGUID guid, ITfReadOnlyProperty** out) override {
+     assert(guid == GUID_PROP_INPUTSCOPE);
+     *out = nullptr;
+-    if (result == S_OK) { *out = &property; property.AddRef(); }
++    if (result == S_OK && !nullProperty) { *out = &property; property.AddRef(); }
+     return result;
+   }
+   UNUSED_METHOD(RequestEditSession, (TfClientId, ITfEditSession*, DWORD, HRESULT*))
+@@ -222,36 +229,68 @@ class ContextFixture : public ComFixture<ITfContext> {
+ 
+ static void TestInputScopes() {
+   ContextFixture context;
++  const auto expect = [&context](bool allowed, HRESULT expectedReason) {
++    HRESULT reason = E_UNEXPECTED;
++    assert(smart_im::AllowsContext(&context, 42, nullptr, &reason) == allowed);
++    assert(reason == expectedReason);
++    // The diagnostic output is optional for existing callers.
++    assert(smart_im::AllowsContext(&context, 42, nullptr) == allowed);
++  };
+   // No property object is returned for these documented optional-property cases.
+-  assert(smart_im::AllowsContext(&context, 42, nullptr));
++  expect(true, S_FALSE);
+   context.result = E_NOTIMPL;
+-  assert(smart_im::AllowsContext(&context, 42, nullptr));
++  expect(true, S_FALSE);
+   for (HRESULT failure : {E_FAIL, E_INVALIDARG, TF_E_DISCONNECTED, E_OUTOFMEMORY}) {
+     context.result = failure;
+-    assert(!smart_im::AllowsContext(&context, 42, nullptr));
++    expect(false, failure);
+   }
+   context.result = S_OK;
+-  assert(smart_im::AllowsContext(&context, 42, nullptr)); // VT_EMPTY
++  context.nullProperty = true;
++  expect(false, E_UNEXPECTED);
++  context.nullProperty = false;
++  expect(true, S_FALSE); // VT_EMPTY
+   context.property.result = S_FALSE;
+-  assert(smart_im::AllowsContext(&context, 42, nullptr)); // uncovered property
+-  context.property.result = TF_E_NOLOCK;
+-  assert(!smart_im::AllowsContext(&context, 42, nullptr));
++  expect(true, S_FALSE); // uncovered property
++  // Real Windows TSF returns this when an ACP store supplies no scope attribute.
++  context.property.result = E_FAIL;
++  expect(true, S_FALSE);
++  for (HRESULT failure : {TF_E_NOLOCK, TF_E_DISCONNECTED, E_ACCESSDENIED,
++                          E_INVALIDARG, E_OUTOFMEMORY, E_NOTIMPL}) {
++    context.property.result = failure;
++    expect(false, failure); // VT_EMPTY must not hide other failures
++  }
++  for (VARTYPE nonempty : {VT_I4, VT_UNKNOWN}) {
++    context.property.result = E_FAIL;
++    context.property.type = nonempty;
++    expect(false, E_FAIL); // failed nonempty variants are not missing scope
++  }
+   context.property.result = S_OK;
+   context.property.type = VT_I4;
+-  assert(!smart_im::AllowsContext(&context, 42, nullptr));
++  expect(false, E_UNEXPECTED);
+   context.property.type = VT_UNKNOWN;
+-  assert(smart_im::AllowsContext(&context, 42, nullptr)); // IS_DEFAULT
++  context.property.nullUnknown = true;
++  expect(false, E_UNEXPECTED);
++  context.property.nullUnknown = false;
++  context.property.scope.queryResult = E_NOINTERFACE;
++  expect(false, E_NOINTERFACE);
++  context.property.scope.queryResult = S_OK;
++  expect(true, S_OK); // IS_DEFAULT
+   context.property.scope.scope = IS_TEXT;
+-  assert(smart_im::AllowsContext(&context, 42, nullptr));
++  expect(true, S_OK);
+   for (InputScope privateScope : {IS_PASSWORD, IS_PRIVATE, IS_NUMERIC_PASSWORD,
+                                  IS_NUMERIC_PIN, IS_ALPHANUMERIC_PIN,
+                                  IS_ALPHANUMERIC_PIN_SET}) {
+     context.property.scope.scope = privateScope;
+-    assert(!smart_im::AllowsContext(&context, 42, nullptr));
++    expect(false, E_ACCESSDENIED);
+   }
+   context.property.scope.scope = IS_TEXT;
+   context.property.scope.result = E_FAIL;
+-  assert(!smart_im::AllowsContext(&context, 42, nullptr));
++  expect(false, E_FAIL);
++  context.property.scope.result = S_OK;
++  context.property.scope.missingArray = true;
++  expect(false, E_UNEXPECTED);
++  context.property.scope.scopeCount = 0;
++  expect(true, S_FALSE);
+   assert(context.property.references == 1 && context.property.scope.references == 1);
+ }
+ 
+diff --git a/WeaselTSF/tests/RealTsfContextTest.cpp b/WeaselTSF/tests/RealTsfContextTest.cpp
+new file mode 100644
+index 0000000..eb87f58
+--- /dev/null
++++ b/WeaselTSF/tests/RealTsfContextTest.cpp
+@@ -0,0 +1,331 @@
++// Run in a VS developer prompt (no IME registration or installation required):
++// cl /std:c++17 /EHsc /utf-8 /DUNICODE /D_UNICODE RealTsfContextTest.cpp
++// /link ole32.lib oleaut32.lib uuid.lib
++// The Windows TSF manager reads only this test's synthesized in-memory store.
++#define NOMINMAX
++#include <windows.h>
++#include <ole2.h>
++#include <initguid.h>
++#include <msctf.h>
++#include <textstor.h>
++#include <inputscope.h>
++#include <atlcomcli.h>
++#include <algorithm>
++#include <cstdio>
++#include <cassert>
++#include <string>
++#include "../LocalContext.h"
++
++static void Require(HRESULT value) {
++  assert(SUCCEEDED(value));
++}
++
++template <class I>
++class ComBase : public I {
++ public:
++  STDMETHODIMP QueryInterface(REFIID iid, void** result) override {
++    *result = nullptr;
++    if (iid != IID_IUnknown && iid != __uuidof(I))
++      return E_NOINTERFACE;
++    *result = static_cast<I*>(this);
++    AddRef();
++    return S_OK;
++  }
++  STDMETHODIMP_(ULONG) AddRef() override { return ++refs; }
++  STDMETHODIMP_(ULONG) Release() override { return --refs; }
++  ULONG refs = 1;
++};
++#define STUB(name, args)            \
++  STDMETHODIMP name args override { \
++    return E_NOTIMPL;               \
++  }
++
++class Scopes : public ComBase<ITfInputScope> {
++ public:
++  InputScope value = IS_TEXT;
++  STDMETHODIMP GetInputScopes(InputScope** result, UINT* count) override {
++    *result = static_cast<InputScope*>(CoTaskMemAlloc(sizeof(InputScope)));
++    **result = value;
++    *count = 1;
++    return S_OK;
++  }
++  STUB(GetPhrase, (BSTR**, UINT*))
++  STUB(GetRegularExpression, (BSTR*))
++  STUB(GetSRGS, (BSTR*))
++  STUB(GetXML, (BSTR*))
++};
++
++class Store : public ComBase<ITextStoreACP> {
++ public:
++  Scopes scopes;
++  bool withScope = false;
++  CComPtr<ITextStoreACPSink> sink;
++  std::wstring text = L"existing left|existing right";
++  TS_SELECTION_ACP selection{14, 14, {TS_AE_NONE, FALSE}};
++  DWORD lock = 0;
++  STDMETHODIMP AdviseSink(REFIID iid, IUnknown* source, DWORD) override {
++    if (iid != IID_ITextStoreACPSink)
++      return E_NOINTERFACE;
++    sink.Release();
++    return source->QueryInterface(&sink);
++  }
++  STDMETHODIMP UnadviseSink(IUnknown*) override {
++    sink.Release();
++    return S_OK;
++  }
++  STDMETHODIMP RequestLock(DWORD flags, HRESULT* result) override {
++    if (!sink)
++      return E_FAIL;
++    if (lock) {
++      *result = TS_E_SYNCHRONOUS;
++      return S_OK;
++    }
++    lock = flags;
++    *result = sink->OnLockGranted(flags);
++    lock = 0;
++    return S_OK;
++  }
++  STDMETHODIMP GetStatus(TS_STATUS* status) override {
++    *status = {};
++    return S_OK;
++  }
++  STDMETHODIMP QueryInsert(LONG start,
++                           LONG end,
++                           ULONG,
++                           LONG* outStart,
++                           LONG* outEnd) override {
++    *outStart = start;
++    *outEnd = end;
++    return S_OK;
++  }
++  STDMETHODIMP GetSelection(ULONG,
++                            ULONG count,
++                            TS_SELECTION_ACP* out,
++                            ULONG* got) override {
++    if (!lock)
++      return TS_E_NOLOCK;
++    *got = count ? 1 : 0;
++    if (count)
++      *out = selection;
++    return S_OK;
++  }
++  STDMETHODIMP SetSelection(ULONG count,
++                            const TS_SELECTION_ACP* value) override {
++    if (!(lock & TS_LF_READWRITE))
++      return TS_E_NOLOCK;
++    if (count != 1)
++      return E_INVALIDARG;
++    selection = *value;
++    return S_OK;
++  }
++  STDMETHODIMP GetText(LONG start,
++                       LONG end,
++                       WCHAR* buffer,
++                       ULONG capacity,
++                       ULONG* written,
++                       TS_RUNINFO* runs,
++                       ULONG runCapacity,
++                       ULONG* runCount,
++                       LONG* next) override {
++    if (!lock)
++      return TS_E_NOLOCK;
++    if (end == -1)
++      end = static_cast<LONG>(text.size());
++    if (start < 0 || end < start || end > static_cast<LONG>(text.size()))
++      return TS_E_INVALIDPOS;
++    ULONG count = static_cast<ULONG>(end - start);
++    if (buffer)
++      count = (std::min)(capacity, count);
++    if (written)
++      *written = buffer ? count : 0;
++    if (buffer)
++      std::copy_n(text.data() + start, count, buffer);
++    if (runCount)
++      *runCount = runCapacity && count ? 1 : 0;
++    if (runCapacity && count)
++      *runs = {count, TS_RT_PLAIN};
++    if (next)
++      *next = start + count;
++    return S_OK;
++  }
++  STDMETHODIMP SetText(DWORD,
++                       LONG start,
++                       LONG end,
++                       const WCHAR* value,
++                       ULONG count,
++                       TS_TEXTCHANGE* change) override {
++    text.replace(start, end - start, value, count);
++    *change = {start, end, start + static_cast<LONG>(count)};
++    return S_OK;
++  }
++  STUB(GetFormattedText, (LONG, LONG, IDataObject**))
++  STUB(GetEmbedded, (LONG, REFGUID, REFIID, IUnknown**))
++  STDMETHODIMP QueryInsertEmbedded(const GUID*,
++                                   const FORMATETC*,
++                                   BOOL* allowed) override {
++    *allowed = FALSE;
++    return S_OK;
++  }
++  STUB(InsertEmbedded, (DWORD, LONG, LONG, IDataObject*, TS_TEXTCHANGE*))
++  STDMETHODIMP InsertTextAtSelection(DWORD flags,
++                                     const WCHAR* value,
++                                     ULONG count,
++                                     LONG* start,
++                                     LONG* end,
++                                     TS_TEXTCHANGE* change) override {
++    if (start)
++      *start = selection.acpStart;
++    if (end)
++      *end = selection.acpEnd;
++    if (flags & TS_IAS_QUERYONLY)
++      return S_OK;
++    return SetText(0, selection.acpStart, selection.acpEnd, value, count,
++                   change);
++  }
++  STUB(InsertEmbeddedAtSelection,
++       (DWORD, IDataObject*, LONG*, LONG*, TS_TEXTCHANGE*))
++  STDMETHODIMP RequestSupportedAttrs(DWORD, ULONG, const TS_ATTRID*) override {
++    return S_OK;
++  }
++  STDMETHODIMP RequestAttrsAtPosition(LONG,
++                                      ULONG,
++                                      const TS_ATTRID*,
++                                      DWORD) override {
++    return S_OK;
++  }
++  STDMETHODIMP RequestAttrsTransitioningAtPosition(LONG,
++                                                   ULONG,
++                                                   const TS_ATTRID*,
++                                                   DWORD) override {
++    return S_OK;
++  }
++  STDMETHODIMP FindNextAttrTransition(LONG,
++                                      LONG halt,
++                                      ULONG,
++                                      const TS_ATTRID*,
++                                      DWORD,
++                                      LONG* next,
++                                      BOOL* found,
++                                      LONG* offset) override {
++    *next = halt;
++    *found = FALSE;
++    *offset = 0;
++    return S_OK;
++  }
++  STDMETHODIMP RetrieveRequestedAttrs(ULONG capacity,
++                                      TS_ATTRVAL* attrs,
++                                      ULONG* count) override {
++    *count = 0;
++    if (withScope && capacity) {
++      attrs[0].idAttr = GUID_PROP_INPUTSCOPE;
++      attrs[0].dwOverlapId = 0;
++      VariantInit(&attrs[0].varValue);
++      attrs[0].varValue.vt = VT_UNKNOWN;
++      attrs[0].varValue.punkVal = &scopes;
++      scopes.AddRef();
++      *count = 1;
++    }
++    return S_OK;
++  }
++  STDMETHODIMP GetEndACP(LONG* end) override {
++    *end = static_cast<LONG>(text.size());
++    return S_OK;
++  }
++  STDMETHODIMP GetActiveView(TsViewCookie* view) override {
++    *view = 1;
++    return S_OK;
++  }
++  STUB(GetACPFromPoint, (TsViewCookie, const POINT*, DWORD, LONG*))
++  STDMETHODIMP GetTextExt(TsViewCookie,
++                          LONG,
++                          LONG,
++                          RECT* rect,
++                          BOOL* clipped) override {
++    *rect = {0, 0, 100, 20};
++    *clipped = FALSE;
++    return S_OK;
++  }
++  STDMETHODIMP GetScreenExt(TsViewCookie, RECT* rect) override {
++    *rect = {0, 0, 100, 20};
++    return S_OK;
++  }
++  STDMETHODIMP GetWnd(TsViewCookie, HWND* window) override {
++    *window = nullptr;
++    return S_OK;
++  }
++};
++
++class Probe : public ComBase<ITfEditSession> {
++ public:
++  CComPtr<ITfContext> context;
++  bool expectedAllowed = true;
++  HRESULT expectedReason = S_OK;
++  bool called = false;
++  STDMETHODIMP DoEditSession(TfEditCookie ec) override {
++    called = true;
++    TF_SELECTION selection{};
++    ULONG fetched = 0;
++    Require(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection,
++                                  &fetched));
++    assert(fetched == 1 && selection.range);
++    CComPtr<ITfRange> range;
++    range.Attach(selection.range);
++    HRESULT reason = E_UNEXPECTED;
++    assert(smart_im::AllowsContext(context, ec, range, &reason) ==
++           expectedAllowed);
++    assert(reason == expectedReason);
++    if (expectedAllowed) {
++      std::wstring before, after;
++      assert(smart_im::ReadSide(ec, range, true, before));
++      assert(smart_im::ReadSide(ec, range, false, after));
++      assert(before == L"existing left|" && after == L"existing right");
++    }
++    return S_OK;
++  }
++};
++
++static void Check(bool withScope,
++                  InputScope scope,
++                  bool allowed,
++                  HRESULT reason) {
++  Store store;
++  store.withScope = withScope;
++  store.scopes.value = scope;
++  Probe probe;
++  probe.expectedAllowed = allowed;
++  probe.expectedReason = reason;
++  CComPtr<ITfThreadMgrEx> manager;
++  Require(manager.CoCreateInstance(CLSID_TF_ThreadMgr));
++  TfClientId client = TF_CLIENTID_NULL;
++  Require(manager->ActivateEx(
++      &client, TF_TMAE_NOACTIVATETIP | TF_TMAE_NOACTIVATEKEYBOARDLAYOUT));
++  CComPtr<ITfDocumentMgr> document;
++  Require(manager->CreateDocumentMgr(&document));
++  TfEditCookie ownerCookie = 0;
++  Require(
++      document->CreateContext(client, 0, &store, &probe.context, &ownerCookie));
++  Require(document->Push(probe.context));
++  HRESULT result = E_UNEXPECTED;
++  Require(probe.context->RequestEditSession(client, &probe,
++                                            TF_ES_SYNC | TF_ES_READ, &result));
++  Require(result);
++  assert(probe.called);
++  Require(document->Pop(TF_POPF_ALL));
++  probe.context.Release();
++  document.Release();
++  Require(manager->Deactivate());
++}
++
++int main() {
++  Require(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
++  Check(false, IS_DEFAULT, true, S_FALSE);
++  Check(true, IS_DEFAULT, true, S_OK);
++  Check(true, IS_TEXT, true, S_OK);
++  for (InputScope sensitive :
++       {IS_PASSWORD, IS_PRIVATE, IS_NUMERIC_PASSWORD, IS_NUMERIC_PIN,
++        IS_ALPHANUMERIC_PIN, IS_ALPHANUMERIC_PIN_SET}) {
++    Check(true, sensitive, false, E_ACCESSDENIED);
++  }
++  CoUninitialize();
++  std::puts("Real Windows TSF optional-scope and bounded-read tests passed");
++}
+
+From b3e17d638ceda21154a9d3c918ed5acb4c4631b0 Mon Sep 17 00:00:00 2001
+From: felix07 <l.shuheng@stu.xjtu.edu.cn>
+Date: Thu, 1 Oct 2026 17:06:19 +0800
+Subject: [PATCH 6/9] feat(tsf): add bounded opt-in context diagnostics
+
+---
+ WeaselTSF/LocalContext.cpp    | 94 ++++++++++++++++++++++++-----------
+ include/SmartIMContextTrace.h | 71 ++++++++++++++++++++++++++
+ 2 files changed, 135 insertions(+), 30 deletions(-)
+ create mode 100644 include/SmartIMContextTrace.h
+
+diff --git a/WeaselTSF/LocalContext.cpp b/WeaselTSF/LocalContext.cpp
+index a2201d2..543a4d5 100644
+--- a/WeaselTSF/LocalContext.cpp
++++ b/WeaselTSF/LocalContext.cpp
+@@ -3,6 +3,7 @@
+ #include <initguid.h>
+ #include "LocalContext.h"
+ #include <SmartIMContext.h>
++#include <SmartIMContextTrace.h>
+ #include <inputscope.h>
+ 
+ namespace {
+@@ -20,6 +21,8 @@ class CReadLocalContextSession : public CEditSession {
+ }  // namespace
+ 
+ void WeaselTSF::_InvalidateLocalContext(bool documentChanged) {
++  smart_im::TraceContext("invalidate", S_OK, documentChanged,
++                         !_localContextPacket.empty());
+   if (documentChanged)
+     ++_documentEpoch;
+   ++_localContextGeneration;
+@@ -38,29 +41,46 @@ void WeaselTSF::_InvalidateLocalContext(bool documentChanged) {
+ bool WeaselTSF::_ReadLocalContext(ITfContext* context,
+                                   TfEditCookie ec,
+                                   bool compareSelection) {
+-  if (!context || !_pThreadMgr || _localContextSuspended ||
+-      _pendingCompositionEnds.count(context) != 0 ||
+-      _status.schema_id != L"smart_im" || _status.disabled ||
+-      (_activateFlags & TF_TMF_SECUREMODE) || _IsKeyboardDisabled())
++  const auto fail = [](const char* stage, HRESULT hr = E_FAIL) {
++    smart_im::TraceContext(stage, hr);
+     return false;
++  };
++  if (!context || !_pThreadMgr)
++    return fail("no_context_or_manager");
++  if (_localContextSuspended)
++    return fail("suspended");
++  if (_pendingCompositionEnds.count(context) != 0)
++    return fail("pending_composition_end");
++  if (_status.schema_id != L"smart_im")
++    return fail("schema_mismatch");
++  if (_status.disabled || (_activateFlags & TF_TMF_SECUREMODE) ||
++      _IsKeyboardDisabled())
++    return fail("protected_or_disabled", E_ACCESSDENIED);
+   CComPtr<ITfDocumentMgr> focused;
+   CComPtr<ITfContext> top;
+   TF_STATUS status{};
+-  if (_pThreadMgr->GetFocus(&focused) != S_OK || !focused ||
+-      focused->GetTop(&top) != S_OK || top.p != context ||
+-      context->GetStatus(&status) != S_OK ||
+-      (status.dwStaticFlags & TS_SS_TRANSITORY))
+-    return false;
++  HRESULT hr = _pThreadMgr->GetFocus(&focused);
++  if (hr != S_OK || !focused)
++    return fail("focused_document", hr);
++  hr = focused->GetTop(&top);
++  if (hr != S_OK || top.p != context)
++    return fail("focused_context", hr);
++  hr = context->GetStatus(&status);
++  if (hr != S_OK)
++    return fail("context_status", hr);
++  if (status.dwStaticFlags & TS_SS_TRANSITORY)
++    return fail("transitory_context");
+ 
+   TF_SELECTION selection{};
+   ULONG fetched = 0;
+-  if (context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched) != S_OK ||
+-      fetched != 1 || !selection.range)
+-    return false;
++  hr = context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
++  if (hr != S_OK || fetched != 1 || !selection.range)
++    return fail("selection", hr);
+   CComPtr<ITfRange> selectionRange;
+   selectionRange.Attach(selection.range);
+-  if (!smart_im::AllowsContext(context, ec, selectionRange))
+-    return false;
++  HRESULT scopeResult = S_OK;
++  if (!smart_im::AllowsContext(context, ec, selectionRange, &scopeResult))
++    return fail("input_scope", scopeResult);
+ 
+   CComPtr<ITfRange> replacement = selectionRange;
+   if (_pComposition) {
+@@ -69,41 +89,54 @@ bool WeaselTSF::_ReadLocalContext(ITfContext* context,
+     if (_pComposition->GetRange(&composition) != S_OK || !composition ||
+         composition->GetContext(&owner) != S_OK || owner.p != context ||
+         !smart_im::Covers(ec, composition, selectionRange))
+-      return false;
++      return fail("composition_range");
+     replacement = composition;
+   }
+   std::wstring before, after, beforeHex, afterHex;
+-  if (!smart_im::ReadSide(ec, replacement, true, before) ||
+-      !smart_im::ReadSide(ec, replacement, false, after) ||
+-      !smart_im::Utf8Hex(before, beforeHex) ||
++  if (!smart_im::ReadSide(ec, replacement, true, before))
++    return fail("read_before");
++  if (!smart_im::ReadSide(ec, replacement, false, after))
++    return fail("read_after");
++  if (!smart_im::Utf8Hex(before, beforeHex) ||
+       !smart_im::Utf8Hex(after, afterHex))
+-    return false;
++    return fail("encode_context");
+ 
+   const bool moved = compareSelection && _localSelection &&
+-      !smart_im::SameRange(ec, _localSelection, selectionRange);
+-  if (_localContext.p != context || moved || _localBefore != before || _localAfter != after)
+-    _InvalidateLocalContext(moved || (_localContext && _localContext.p != context));
++                     !smart_im::SameRange(ec, _localSelection, selectionRange);
++  if (_localContext.p != context || moved || _localBefore != before ||
++      _localAfter != after)
++    _InvalidateLocalContext(moved ||
++                            (_localContext && _localContext.p != context));
+   _localContext = context;
+   _localSelection.Release();
+   if (selectionRange->Clone(&_localSelection) != S_OK)
+-    return false;
++    return fail("clone_selection");
+   _localBefore = before;
+   _localAfter = after;
+-  const std::wstring token = std::to_wstring(GetCurrentProcessId()) + L"_" +
++  const std::wstring token =
++      std::to_wstring(GetCurrentProcessId()) + L"_" +
+       std::to_wstring(GetCurrentThreadId()) + L"_" +
+       std::to_wstring(reinterpret_cast<ULONG_PTR>(this)) + L"_" +
+       std::to_wstring(_localContextGeneration);
+   _localContextPacket = L"1\t" + token + L"\t" + beforeHex + L"\t" + afterHex;
+-  return smart_im::ValidPacket(_localContextPacket);
++  if (!smart_im::ValidPacket(_localContextPacket))
++    return fail("invalid_packet");
++  smart_im::TraceContext("read_ok", scopeResult,
++                         static_cast<ULONG>(before.size()),
++                         static_cast<ULONG>(after.size()));
++  return true;
+ }
+ 
+ void WeaselTSF::_PublishLocalContext(bool force) {
+   if (!_localContextPacket.empty() &&
+       (force || _localContextPacket != _localPublishedPacket)) {
+-    if (m_client.UpdateLocalContext(_localContextPacket))
++    if (m_client.UpdateLocalContext(_localContextPacket)) {
+       _localPublishedPacket = _localContextPacket;
+-    else
++      smart_im::TraceContext("publish_ok");
++    } else {
++      smart_im::TraceContext("publish_failed");
+       _InvalidateLocalContext();
++    }
+   }
+ }
+ 
+@@ -117,8 +150,9 @@ void WeaselTSF::_RefreshLocalContext(ITfContext* context) {
+   CComPtr<CReadLocalContextSession> session;
+   session.Attach(new CReadLocalContextSession(this, context));
+   HRESULT result = E_FAIL;
+-  const HRESULT hr = context->RequestEditSession(_tfClientId, session,
+-                                                TF_ES_SYNC | TF_ES_READ, &result);
++  const HRESULT hr = context->RequestEditSession(
++      _tfClientId, session, TF_ES_SYNC | TF_ES_READ, &result);
++  smart_im::TraceContext("edit_session", hr, static_cast<ULONG>(result));
+   if (FAILED(hr) || result != S_OK)
+     _InvalidateLocalContext();
+   else
+@@ -133,5 +167,5 @@ bool WeaselTSF::_IsCurrentDocument(ITfContext* context, ULONGLONG epoch) const {
+   CComPtr<ITfDocumentMgr> document;
+   CComPtr<ITfContext> top;
+   return _pThreadMgr->GetFocus(&document) == S_OK && document &&
+-      document->GetTop(&top) == S_OK && top.p == context;
++         document->GetTop(&top) == S_OK && top.p == context;
+ }
+diff --git a/include/SmartIMContextTrace.h b/include/SmartIMContextTrace.h
+new file mode 100644
+index 0000000..b8fee5f
+--- /dev/null
++++ b/include/SmartIMContextTrace.h
+@@ -0,0 +1,71 @@
++#pragma once
++
++#include <array>
++#include <cstdio>
++#include <string>
++#include <windows.h>
++
++namespace smart_im {
++
++// Opt-in diagnostics contain only fixed stage names, HRESULTs and counts.
++// Never pass document text, pinyin, candidate text or packet contents here.
++// Each thread keeps at most 48 records and overwrites its own bounded file.
++inline void TraceContext(const char* stage,
++                         HRESULT hr = S_OK,
++                         ULONG first = 0,
++                         ULONG second = 0) {
++  struct LastErrorGuard {
++    DWORD value = GetLastError();
++    ~LastErrorGuard() { SetLastError(value); }
++  } guard;
++  struct State {
++    ULONGLONG nextCheck = 0;
++    bool enabled = false;
++    std::wstring directory;
++    std::array<std::string, 48> records;
++    size_t count = 0;
++  };
++  static thread_local State state;
++  const ULONGLONG now = GetTickCount64();
++  if (now >= state.nextCheck) {
++    state.nextCheck = now + 1000;
++    WCHAR local[MAX_PATH]{};
++    const DWORD length =
++        GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
++    state.enabled = false;
++    if (length > 0 && length < MAX_PATH) {
++      state.directory = std::wstring(local) + L"\\SmartIM\\tsf-trace\\";
++      const DWORD attributes =
++          GetFileAttributesW((state.directory + L"enabled").c_str());
++      state.enabled = attributes != INVALID_FILE_ATTRIBUTES &&
++                      !(attributes & FILE_ATTRIBUTE_DIRECTORY);
++    }
++  }
++  if (!state.enabled)
++    return;
++  char line[192]{};
++  _snprintf_s(line, sizeof(line), _TRUNCATE, "%llu %s hr=%08lX a=%lu b=%lu\r\n",
++              now, stage, static_cast<ULONG>(hr), first, second);
++  state.records[state.count++ % state.records.size()] = line;
++  const size_t start = state.count > state.records.size()
++                           ? state.count - state.records.size()
++                           : 0;
++  std::string output;
++  for (size_t i = start; i < state.count; ++i)
++    output += state.records[i % state.records.size()];
++  const std::wstring path = state.directory +
++                            std::to_wstring(GetCurrentProcessId()) + L"-" +
++                            std::to_wstring(GetCurrentThreadId()) + L".log";
++  HANDLE file =
++      CreateFileW(path.c_str(), GENERIC_WRITE,
++                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                  nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++  if (file != INVALID_HANDLE_VALUE) {
++    DWORD written = 0;
++    WriteFile(file, output.data(), static_cast<DWORD>(output.size()), &written,
++              nullptr);
++    CloseHandle(file);
++  }
++}
++
++}  // namespace smart_im
+
+From 4af65c0871fbbcd994de6aad3a633bdb864b2ac2 Mon Sep 17 00:00:00 2001
+From: felix07 <l.shuheng@stu.xjtu.edu.cn>
+Date: Thu, 1 Oct 2026 17:06:54 +0800
+Subject: [PATCH 7/9] fix(tsf): diagnose bounded range read failures
+
+---
+ WeaselTSF/LocalContext.h | 43 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/WeaselTSF/LocalContext.h b/WeaselTSF/LocalContext.h
+index 9861b79..76bd8d4 100644
+--- a/WeaselTSF/LocalContext.h
++++ b/WeaselTSF/LocalContext.h
+@@ -5,6 +5,7 @@
+ #include <msctf.h>
+ #include <inputscope.h>
+ #include <atlcomcli.h>
++#include "../include/SmartIMContextTrace.h"
+ 
+ namespace smart_im {
+ 
+@@ -32,31 +33,59 @@ inline bool ReadSide(TfEditCookie ec,
+                      bool before,
+                      std::wstring& text) {
+   CComPtr<ITfRange> range;
+-  if (replacement->Clone(&range) != S_OK || !range ||
+-      range->Collapse(ec, before ? TF_ANCHOR_START : TF_ANCHOR_END) != S_OK)
++  const HRESULT cloneResult = replacement->Clone(&range);
++  if (cloneResult != S_OK || !range) {
++    TraceContext(before ? "read.before.clone" : "read.after.clone",
++                 cloneResult == S_OK ? E_UNEXPECTED : cloneResult);
+     return false;
++  }
++  const HRESULT collapseResult =
++      range->Collapse(ec, before ? TF_ANCHOR_START : TF_ANCHOR_END);
++  if (collapseResult != S_OK) {
++    TraceContext(before ? "read.before.collapse" : "read.after.collapse",
++                 collapseResult);
++    return false;
++  }
+   LONG moved = 0;
+   const HRESULT hr = before
+       ? range->ShiftStart(ec, -static_cast<LONG>(kContextUnits), &moved, nullptr)
+       : range->ShiftEnd(ec, static_cast<LONG>(kContextUnits), &moved, nullptr);
+-  if (FAILED(hr))
++  if (FAILED(hr)) {
++    TraceContext(before ? "read.before.shift" : "read.after.shift", hr);
+     return false;
++  }
+   const LONG expected = before ? -moved : moved;
+-  if (expected < 0 || expected > static_cast<LONG>(kContextUnits))
++  if (expected < 0 || expected > static_cast<LONG>(kContextUnits)) {
++    TraceContext(before ? "read.before.extent" : "read.after.extent",
++                 E_UNEXPECTED, static_cast<ULONG>(expected), kContextUnits);
+     return false;
++  }
+   WCHAR buffer[kContextUnits];
+   ULONG count = 0;
+   // Do not use TF_TF_IGNOREEND: it would include composition/selected text.
+-  if (range->GetText(ec, 0, buffer, kContextUnits, &count) != S_OK ||
+-      count != static_cast<ULONG>(expected))
++  const HRESULT textResult = range->GetText(ec, 0, buffer, kContextUnits, &count);
++  if (textResult != S_OK) {
++    TraceContext(before ? "read.before.get-text" : "read.after.get-text",
++                 textResult, static_cast<ULONG>(expected), count);
+     return false;
++  }
++  if (count != static_cast<ULONG>(expected)) {
++    TraceContext(before ? "read.before.count" : "read.after.count",
++                 E_UNEXPECTED, static_cast<ULONG>(expected), count);
++    return false;
++  }
+   text.assign(buffer, count);
+   // A bounded read may cut a surrogate pair at its outer edge.
+   if (before && !text.empty() && text.front() >= 0xdc00 && text.front() <= 0xdfff)
+     text.erase(0, 1);
+   if (!before && !text.empty() && text.back() >= 0xd800 && text.back() <= 0xdbff)
+     text.pop_back();
+-  return text.find(L'\0') == std::wstring::npos;
++  if (text.find(L'\0') != std::wstring::npos) {
++    TraceContext(before ? "read.before.embedded-null" : "read.after.embedded-null",
++                 E_UNEXPECTED, count);
++    return false;
++  }
++  return true;
+ }
+ 
+ inline bool Utf8Hex(const std::wstring& text, std::wstring& result) {
+
+From 898ec0871ceae64cf0d42d164fd4e10dbcfe61ed Mon Sep 17 00:00:00 2001
+From: felix07 <l.shuheng@stu.xjtu.edu.cn>
+Date: Thu, 1 Oct 2026 17:10:35 +0800
+Subject: [PATCH 8/9] fix(tsf): read Chromium text stores marked transitory
+
+---
+ WeaselTSF/LocalContext.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/WeaselTSF/LocalContext.cpp b/WeaselTSF/LocalContext.cpp
+index 543a4d5..d71423b 100644
+--- a/WeaselTSF/LocalContext.cpp
++++ b/WeaselTSF/LocalContext.cpp
+@@ -68,8 +68,11 @@ bool WeaselTSF::_ReadLocalContext(ITfContext* context,
+   hr = context->GetStatus(&status);
+   if (hr != S_OK)
+     return fail("context_status", hr);
+-  if (status.dwStaticFlags & TS_SS_TRANSITORY)
+-    return fail("transitory_context");
++  // Chromium marks ordinary editable text stores as transitory too. This is
++  // a lifetime hint, not a restriction on reading their surrounding text.
++  // Validate the focused store's scope, lock and actual ranges below.
++  smart_im::TraceContext("context_status", S_OK, status.dwStaticFlags,
++                        status.dwDynamicFlags);
+ 
+   TF_SELECTION selection{};
+   ULONG fetched = 0;
+
+From 3427e2ed3c1be4f394e9ea15c91c9d167fab1e8b Mon Sep 17 00:00:00 2001
+From: felix07 <l.shuheng@stu.xjtu.edu.cn>
+Date: Thu, 1 Oct 2026 17:13:27 +0800
+Subject: [PATCH 9/9] test(tsf): cover transitory document context reads
+
+---
+ WeaselTSF/tests/RealTsfContextTest.cpp | 56 +++++++++++++++++++++-----
+ 1 file changed, 45 insertions(+), 11 deletions(-)
+
+diff --git a/WeaselTSF/tests/RealTsfContextTest.cpp b/WeaselTSF/tests/RealTsfContextTest.cpp
+index eb87f58..6d7b7e2 100644
+--- a/WeaselTSF/tests/RealTsfContextTest.cpp
++++ b/WeaselTSF/tests/RealTsfContextTest.cpp
+@@ -59,6 +59,7 @@ class Store : public ComBase<ITextStoreACP> {
+  public:
+   Scopes scopes;
+   bool withScope = false;
++  DWORD staticFlags = 0;
+   CComPtr<ITextStoreACPSink> sink;
+   std::wstring text = L"existing left|existing right";
+   TS_SELECTION_ACP selection{14, 14, {TS_AE_NONE, FALSE}};
+@@ -87,6 +88,7 @@ class Store : public ComBase<ITextStoreACP> {
+   }
+   STDMETHODIMP GetStatus(TS_STATUS* status) override {
+     *status = {};
++    status->dwStaticFlags = staticFlags;
+     return S_OK;
+   }
+   STDMETHODIMP QueryInsert(LONG start,
+@@ -261,8 +263,13 @@ class Probe : public ComBase<ITfEditSession> {
+   bool expectedAllowed = true;
+   HRESULT expectedReason = S_OK;
+   bool called = false;
++  DWORD expectedStaticFlags = 0;
++  bool withComposition = false;
+   STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+     called = true;
++    TF_STATUS status{};
++    Require(context->GetStatus(&status));
++    assert(status.dwStaticFlags == expectedStaticFlags);
+     TF_SELECTION selection{};
+     ULONG fetched = 0;
+     Require(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection,
+@@ -275,9 +282,20 @@ class Probe : public ComBase<ITfEditSession> {
+            expectedAllowed);
+     assert(reason == expectedReason);
+     if (expectedAllowed) {
++      CComPtr<ITfRange> replacement = range;
++      if (withComposition) {
++        // Model the frontend's complete composition bounds on real ITfRanges.
++        // Selected Chinese and active pinyin must both stay outside body text.
++        replacement.Release();
++        Require(range->Clone(&replacement));
++        Require(range->Collapse(ec, TF_ANCHOR_END));
++        TF_SELECTION caret{range, {TF_AE_END, FALSE}};
++        Require(context->SetSelection(ec, 1, &caret));
++        assert(smart_im::Covers(ec, replacement, range));
++      }
+       std::wstring before, after;
+-      assert(smart_im::ReadSide(ec, range, true, before));
+-      assert(smart_im::ReadSide(ec, range, false, after));
++      assert(smart_im::ReadSide(ec, replacement, true, before));
++      assert(smart_im::ReadSide(ec, replacement, false, after));
+       assert(before == L"existing left|" && after == L"existing right");
+     }
+     return S_OK;
+@@ -287,13 +305,22 @@ class Probe : public ComBase<ITfEditSession> {
+ static void Check(bool withScope,
+                   InputScope scope,
+                   bool allowed,
+-                  HRESULT reason) {
++                  HRESULT reason,
++                  DWORD staticFlags = 0,
++                  bool withComposition = false) {
+   Store store;
+   store.withScope = withScope;
+   store.scopes.value = scope;
++  store.staticFlags = staticFlags;
++  if (withComposition) {
++    store.text = L"existing left|已选pinexisting right";
++    store.selection.acpEnd = 19;
++  }
+   Probe probe;
+   probe.expectedAllowed = allowed;
+   probe.expectedReason = reason;
++  probe.expectedStaticFlags = staticFlags;
++  probe.withComposition = withComposition;
+   CComPtr<ITfThreadMgrEx> manager;
+   Require(manager.CoCreateInstance(CLSID_TF_ThreadMgr));
+   TfClientId client = TF_CLIENTID_NULL;
+@@ -306,8 +333,9 @@ static void Check(bool withScope,
+       document->CreateContext(client, 0, &store, &probe.context, &ownerCookie));
+   Require(document->Push(probe.context));
+   HRESULT result = E_UNEXPECTED;
++  const DWORD access = withComposition ? TF_ES_READWRITE : TF_ES_READ;
+   Require(probe.context->RequestEditSession(client, &probe,
+-                                            TF_ES_SYNC | TF_ES_READ, &result));
++                                            TF_ES_SYNC | access, &result));
+   Require(result);
+   assert(probe.called);
+   Require(document->Pop(TF_POPF_ALL));
+@@ -318,13 +346,19 @@ static void Check(bool withScope,
+ 
+ int main() {
+   Require(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+-  Check(false, IS_DEFAULT, true, S_FALSE);
+-  Check(true, IS_DEFAULT, true, S_OK);
+-  Check(true, IS_TEXT, true, S_OK);
+-  for (InputScope sensitive :
+-       {IS_PASSWORD, IS_PRIVATE, IS_NUMERIC_PASSWORD, IS_NUMERIC_PIN,
+-        IS_ALPHANUMERIC_PIN, IS_ALPHANUMERIC_PIN_SET}) {
+-    Check(true, sensitive, false, E_ACCESSDENIED);
++  // Chromium marks its real document store as transitory. Windows still
++  // exposes pre-existing body text and proper composition ranges through TSF.
++  for (DWORD flags : {DWORD{0}, DWORD{TS_SS_TRANSITORY | TS_SS_NOHIDDENTEXT}}) {
++    Check(false, IS_DEFAULT, true, S_FALSE, flags);
++    Check(true, IS_DEFAULT, true, S_OK, flags);
++    Check(true, IS_TEXT, true, S_OK, flags);
++    Check(false, IS_DEFAULT, true, S_FALSE, flags, true);
++    Check(true, IS_TEXT, true, S_OK, flags, true);
++    for (InputScope sensitive :
++         {IS_PASSWORD, IS_PRIVATE, IS_NUMERIC_PASSWORD, IS_NUMERIC_PIN,
++          IS_ALPHANUMERIC_PIN, IS_ALPHANUMERIC_PIN_SET}) {
++      Check(true, sensitive, false, E_ACCESSDENIED, flags);
++    }
+   }
+   CoUninitialize();
+   std::puts("Real Windows TSF optional-scope and bounded-read tests passed");

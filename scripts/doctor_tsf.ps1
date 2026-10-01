@@ -3,16 +3,24 @@
 Read-only checks for a complete Smart IM TSF installation.
 .DESCRIPTION
 Reads process paths, registration, binary feature markers/hashes, the Lua file
-hash and the bounded heartbeat timestamp. Never reads requests, responses,
+hash and the bounded heartbeat timestamp. For the named input applications,
+reads only loaded Weasel module metadata and its first 1024 PE-header bytes.
+Never reads requests, responses, process heaps,
 learning databases, editor contents or any captured document text.
 Native feature markers are evidence of a build, not an end-to-end TSF test.
 No process is stopped, file written, registry changed or installer launched.
+.PARAMETER Processes
+Application process names to check for a stale loaded Weasel DLL. Defaults to
+Code, notepad, msedge, chrome, QQ and Weixin. Names are exact, without .exe.
+Use an empty array to skip loaded-module checks.
 #>
 [CmdletBinding()]
 param(
     [string]$WeaselRoot = "",
     [string]$RimeUserDir = "",
-    [string]$NativeBuildDir = ""
+    [string]$NativeBuildDir = "",
+    [ValidatePattern('^[\p{L}\p{N}_. -]{1,80}$')]
+    [string[]]$Processes = @("Code", "notepad", "msedge", "chrome", "QQ", "Weixin")
 )
 
 $ErrorActionPreference = "Stop"
@@ -103,8 +111,107 @@ function Read-BinaryEvidence {
     return [pscustomobject]$result
 }
 
+function Read-PeHeaderIdentity {
+    param([byte[]]$Bytes)
+    if ($Bytes.Length -lt 64 -or [BitConverter]::ToUInt16($Bytes, 0) -ne 0x5a4d) {
+        throw "Invalid DOS header."
+    }
+    $offset = [BitConverter]::ToInt32($Bytes, 60)
+    if ($offset -lt 64 -or $offset -gt $Bytes.Length - 84 -or
+        [BitConverter]::ToUInt32($Bytes, $offset) -ne 0x00004550 -or
+        [BitConverter]::ToUInt16($Bytes, $offset + 20) -lt 60 -or
+        [BitConverter]::ToUInt16($Bytes, $offset + 24) -notin @(0x010b, 0x020b)) {
+        throw "Invalid or unsupported PE header."
+    }
+    return [pscustomobject]@{
+        Machine = [BitConverter]::ToUInt16($Bytes, $offset + 4)
+        TimeDateStamp = [BitConverter]::ToUInt32($Bytes, $offset + 8)
+        SizeOfImage = [BitConverter]::ToUInt32($Bytes, $offset + 80)
+    }
+}
+
+function Read-LoadedTsfEvidence {
+    param([string[]]$ProcessNames, [string]$InstallRoot)
+    if (-not $ProcessNames -or -not $InstallRoot) { return }
+    if ($ProcessNames.Count -gt 32) { throw "At most 32 application process names may be checked." }
+    if (-not ("SmartIM.ReadOnlyModuleHeader" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace SmartIM {
+    public static class ReadOnlyModuleHeader {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ReadProcessMemory(IntPtr process, IntPtr address,
+            [Out] byte[] buffer, UIntPtr size, out UIntPtr bytesRead);
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+        public static byte[] Read(int processId, IntPtr moduleBase) {
+            // PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ. Never request
+            // write, injection, suspend or termination rights; read only one header.
+            IntPtr process = OpenProcess(0x1010, false, processId);
+            if (process == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            try {
+                byte[] header = new byte[1024];
+                UIntPtr count;
+                if (!ReadProcessMemory(process, moduleBase, header,
+                    new UIntPtr(1024), out count))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (count.ToUInt64() != 1024) throw new InvalidOperationException("Incomplete PE header.");
+                return header;
+            } finally { CloseHandle(process); }
+        }
+    }
+}
+'@
+    }
+    $referenceHeaders = @{}
+    foreach ($entry in @(@(0x8664, "weaselx64.dll"), @(0x014c, "weasel.dll"))) {
+        $stream = $null
+        try {
+            $stream = [IO.File]::OpenRead((Join-Path $InstallRoot $entry[1]))
+            $bytes = New-Object byte[] 1024
+            $count = $stream.Read($bytes, 0, $bytes.Length)
+            if ($count -ne $bytes.Length) { throw "Incomplete file PE header." }
+            $identity = Read-PeHeaderIdentity $bytes
+            if ($identity.Machine -ne $entry[0]) { throw "Unexpected reference architecture." }
+            $referenceHeaders[[int]$entry[0]] = $identity
+        } catch {
+            # Missing/unreadable disk files are reported by the existing checks.
+        } finally { if ($stream) { $stream.Dispose() } }
+    }
+    foreach ($application in @(Get-Process -Name ($ProcessNames | Select-Object -Unique) -ErrorAction SilentlyContinue)) {
+        try {
+            $modules = @($application.Modules | Where-Object {
+                $_.ModuleName -match '^weasel(?:x64)?\.dll(?:\.(?:old\.\d+|smart-im-old-[0-9a-f]+))?$'
+            })
+            foreach ($module in $modules) {
+                try {
+                    $identity = Read-PeHeaderIdentity ([SmartIM.ReadOnlyModuleHeader]::Read($application.Id, $module.BaseAddress))
+                    $reference = $referenceHeaders[[int]$identity.Machine]
+                    $status = "unavailable"
+                    if ($reference) {
+                        $status = if ($identity.TimeDateStamp -eq $reference.TimeDateStamp -and
+                            $identity.SizeOfImage -eq $reference.SizeOfImage) { "matching" } else { "stale" }
+                    }
+                } catch {
+                    $status = "access denied or unavailable"
+                }
+                [pscustomobject]@{ Name = $application.ProcessName; Id = $application.Id; Status = $status }
+            }
+        } catch {
+            [pscustomobject]@{ Name = $application.ProcessName; Id = $application.Id;
+                Status = "access denied or unavailable" }
+        }
+    }
+}
+
 Write-Output "Smart IM TSF doctor (read-only; no document text is read)"
-Write-Output "Binary evidence describes files on disk; already loaded modules require an application/server restart."
+Write-Output "Disk markers and loaded PE-header identities are checked separately; matching headers are not an end-to-end TSF test."
 $serverPaths = @()
 foreach ($process in @(Get-Process -Name WeaselServer -ErrorAction SilentlyContinue)) {
     try { $processPath = $process.Path } catch { $processPath = "" }
@@ -152,6 +259,18 @@ foreach ($architecture in @("x64", "x86")) {
 }
 foreach ($check in $checks) {
     Write-Output ("[{0}; {1}] {2}: {3}" -f $check.Role, $check.Architecture, $check.Evidence, $check.Path)
+}
+
+$loadedModules = @(Read-LoadedTsfEvidence -ProcessNames $Processes -InstallRoot $WeaselRoot)
+$staleModules = @($loadedModules | Where-Object { $_.Status -eq "stale" })
+foreach ($module in $loadedModules) {
+    Write-Output ("[loaded TSF] {0} PID {1}: {2}" -f $module.Name, $module.Id, $module.Status)
+}
+if ($loadedModules.Count -eq 0) {
+    Write-Output "Loaded TSF: no eligible module found in the selected applications."
+}
+if ($staleModules.Count -gt 0) {
+    Write-Output "ACTION: completely exit and reopen the applications marked stale; their loaded Weasel DLL differs from the installed DLL. Save work before signing out/in if needed."
 }
 
 $repoLua = Join-Path $projectRoot "src\smart_im\rime_assets\lua\smart_im.lua"
@@ -206,7 +325,8 @@ if (-not $nativeVerified) {
 }
 if (-not $luaMatches) { Write-Output "ACTION: update the deployed smart_im.lua from this repository and redeploy Rime." }
 if (-not $heartbeatLive) { Write-Output "ACTION: start/check the Smart IM reranking service; a live heartbeat is required." }
-if (-not $nativeVerified -or -not $luaMatches -or -not $heartbeatLive -or $serverPaths.Count -eq 0) {
+if (-not $nativeVerified -or -not $luaMatches -or -not $heartbeatLive -or $serverPaths.Count -eq 0 -or
+    $staleModules.Count -gt 0) {
     exit 1
 }
 exit 0

@@ -1,5 +1,36 @@
 # 验证记录
 
+## 2026-10-01：Edge 实机确认 transitory 标志误拦截
+
+17:08 前后，已将诊断包 `artifacts/weasel-tsf-0.17.4-context-diagnostic`（原生提交前缀 `4af65`）安装到本机，三个安装目录文件和两个系统 DLL 均完成校验。该次备份为 `%LOCALAPPDATA%\SmartIM\weasel-backup-context-20261001-170755`；普通权限服务启动后的现场 PID 为 2860。此记录确认诊断包安装，不等于后续最终修复包已经安装。
+
+新 Edge 进程 PID 8784 的原生诊断连续返回 `transitory_context`，确认此进程在获取正文前被本实现的 `status.dwStaticFlags & TS_SS_TRANSITORY` 判断拦截。Windows SDK 中 `TF_STATUS` 是 `TS_STATUS` 的别名，两组 TRANSITORY 常量均为 `0x4`，不存在位值混用；错误在于将生命周期提示当作拒绝正文读取的依据。
+
+[Microsoft 文档](https://learn.microsoft.com/en-us/windows/win32/tsf/tf-ss--constants)将其定义为预期短使用周期。[Chromium 当前源码](https://raw.githubusercontent.com/chromium/chromium/main/ui/base/ime/win/tsf_text_store.cc)的普通 `TSFTextStore::GetStatus` 无条件设置 `TS_SS_TRANSITORY | TS_SS_NOHIDDENTEXT`，邻近的 `GetText` 仍提供文档缓冲内容；[原始提交](https://chromium.googlesource.com/chromium/src.git/+/8c9881f99aca8352ba3347c27006f59abb4f13da)说明该标志用于限制韩文重新转换。因此这是具体、已观察到的误拦截，不再只是未安装或缺少可选 input scope 的推测。
+
+最终修复移除 transitory 直接拒绝，保留安全模式、输入域、有效读锁、焦点与范围检查。`artifacts/weasel-tsf-0.17.4-context-fix` 已从干净的原生提交 `3427e2ed3c1be4f394e9ea15c91c9d167fab1e8b` 完成两种位数构建，并于 17:14 完成管理员安装和五文件/注册路径校验；备份为 `%LOCALAPPDATA%\SmartIM\weasel-backup-context-fix-20261001-171227`，随后从普通权限重新启动服务。
+
+- x64/x86 原生解析器各 66 项、COM 范围测试和真实 Windows TSF 回归通过。新的真实 TSF 用例确认携带 `TS_SS_TRANSITORY | TS_SS_NOHIDDENTEXT` 的 store 仍能读取两侧各 14 字符的预存正文；包含已选中文及拼音的合成 replacement range 被完整排除，六类敏感 scope 仍拒绝。此用例的组合范围是合成范围，不是实际 TIP 创建的 composition。
+- 诊断日志的关闭、开启、60 条只保留最后 48 条、关闭后不写入行为在 x64/x86 `/W4 /WX` 独立测试均通过。
+- 九提交源码补丁在独立 worktree 回放后与实现 tree 完全一致：`f237901a569b3f2b8b00f2703e0d4b36e5d078bf`。
+
+**最终修复的真实应用读取结果仍待复验**，已有正文、组合/已选段去重及焦点失效尚不能据此宣称全部通过；也不保证旧式 CUAS/IMM 兼容控件暴露完整上下文。
+
+## 2026-10-01：安装后仍无上下文的读取诊断
+
+用户已完成前版 `artifacts/weasel-tsf-0.17.4-test` 安装并启动服务，仍报告 VS Code、记事本、浏览器和聊天软件都提示缺少上下文。当前磁盘上的前后端原生标记、已部署 Lua 和服务心跳检查通过，因此不能继续沿用首次排查的“原生组件未安装”结论。
+
+- 新增应用已加载 DLL 检查：只读取模块信息和前 1024 字节 PE 文件头，以架构、时间戳和映像大小对照安装版本。现场快照中 Code、QQ、Weixin 加载旧映像，Edge 加载与当时安装版本相符的映像。此检查不是完整内存哈希，也不能证明 TSF 读取成功；受权限限制的进程显示无法检查。
+- 隔离真实 Windows TSF manager / 自建 `ITextStoreACP` 复现：未提供可选 input scope 时，`GetAppProperty` 可取得属性对象，但 `GetValue` 返回 `E_FAIL`，值仍为 `VT_EMPTY`，旧实现因此拒绝读取普通正文。新实现仅将这一组合视为无 scope 提示；其余 API 失败、失败时的非空值，以及明确密码/PIN/私密 scope 继续拒绝。该探针使用合成文本，不是用户应用现场根因证明。
+- 独立命名管道编译生产 `WeaselClientImpl.cpp` 与 `PipeChannel.cpp` 验证通过：真实 StartSession 正文含 `client_type=tsf`，分配的 session 编号贯穿按键与上下文消息，合成上下文及空包失效完整传送，独立上下文连接不覆盖待消费的按键/schema 响应。没有连接用户正在使用的管道。
+- 真实 `rime.dll` 加载项目 Lua 的隔离合成候选探针确认：合法原子属性经按键处理仍可供 filter 使用，空属性才产生 `NO_CONTEXT`。这不包含实际应用 TSF 读取。
+- 另尝试在独立后台进程激活已注册 Weasel profile，仅使用 `TF_IPPMF_FORPROCESS`，未修改系统默认、注册或取得前台焦点。profile 激活成功，但 Windows 未加载键盘 TIP，`GetForeground` 返回 `S_FALSE`，合成 TestKeyDown 均未处理。测试完成后已失活和清理，不能将该结果当作真实键事件验收。
+- 新原生诊断由 `%LOCALAPPDATA%\SmartIM\tsf-trace\enabled` 显式开启，每线程最多保留 48 条固定阶段、HRESULT、计数/长度，不记录正文、拼音、候选或 token。单头文件以 MSVC `/W4 /WX` 编译通过；隔离日志测试写入 120 条后准确保留最后 48 条。诊断有同步磁盘开销，应在复现后删除 `enabled` 关闭。
+
+该阶段生成诊断包 `artifacts/weasel-tsf-0.17.4-context-diagnostic`，随后已安装用于上述 Edge 实机排查；最终修复包为 `artifacts/weasel-tsf-0.17.4-context-fix`。从已安装前版升级时，必须使用新备份普通安装，不能把旧包的 `-Resume` 命令套到新包。步骤见 [安装与诊断](TSF.md#一直提示未获取到局部上下文)。**真实应用仍待验证：** 已有正文可读、正文/组合/已选分段不重复、移动光标及切换控件后旧推荐立即失效。当前证据不能宣称这些端到端场景已通过。
+
+以下各节保留当时阶段的证据和未完成项；其中“尚未安装”或“待续装”不表示用户此后没有完成安装。
+
 ## 2026-10-01：注册器超时后的续装与系统 DLL 更新
 
 后续截图确认 `WeaselSetup /s` 的 60 秒超时及进程树清理已触发，Esc 后终端显示了该错误；不是本次有限等待失效。故障后安装目录三文件为目标版本、两个系统 DLL 为原版，备份完整。没有取得管理员进程堆栈，官方 Setup 内部具体阻塞位置仍不确定。
@@ -11,7 +42,7 @@
 - 独立 64 位 PS5.1 进程把原系统 DLL 复制到隔离目录，用真实 `LoadLibraryW` 加载该副本后成功替换为目标 DLL；旧映像保留到 `FreeLibrary` 后清理。系统目录原文件哈希前后相同，没有注册或激活输入法。
 - 进程超时测试再次通过，3 秒超时后约 4 秒完成测试子进程及后代清理，父进程和无关进程存活。所有 PowerShell 文件语法及 `git diff --check` 通过。
 
-待用户在管理员会话执行原备份续装，再普通权限启动服务、重开应用完成实际输入验收。
+该阶段结束时待用户在管理员会话执行原备份续装。用户随后已完成安装，安装后仍无上下文的进展见本页最新记录。
 
 ## 2026-10-01：安装退出进程无限等待修复
 
@@ -36,7 +67,7 @@
 
 ## 2026-10-01：TSF 局部上下文重构
 
-本次以小狼毫官方 0.17.4 固定提交为基础开发，源码补丁与复现步骤见 [TSF 扩展](TSF.md)。测试未替换系统输入法，未修改实际 Rime 用户目录。
+本阶段以小狼毫官方 0.17.4 固定提交为基础开发，源码补丁与复现步骤见 [TSF 扩展](TSF.md)。此初始测试阶段未替换系统输入法、未修改实际 Rime 用户目录；此后的安装情况见上方记录。
 
 - Python / 真实 Lua / 文件信箱全量测试 **460 passed**。新增测试覆盖原有正文直接读取接口、独立后文、已选分段只拼接一次、未知前缀拒绝、同文不同 token、切换输入框的立即失效及模型计算期间取消。现有候选对象、混合范围、个人学习和失败回退测试保留。
 - Windows 原生 `ITfRange` COM 测试执行实际局部读取 helper：已有正文、整个 composition/占位空格排除、覆盖选区、两侧 128 UTF-16 单元和 region 边界、代理对截断、失败或短读回退通过。text store 由测试实现，不代表真实应用 TSF 验收。
