@@ -26,6 +26,9 @@ class RankRequest:
     pinyin: str
     context: str
     candidates: tuple[str, ...]
+    context_token: str = ""
+    context_after: str = ""
+    selected_prefix: str = ""
 
 
 @dataclass(frozen=True)
@@ -50,9 +53,9 @@ def _lines(data: bytes) -> list[str]:
     return text.split("\n")[:-1]
 
 
-def _header(line: str, operation: str) -> tuple[str, int, bool]:
+def _header(line: str, operation: str, version: str = "SMARTIM1") -> tuple[str, int, bool]:
     fields = line.split("\t")
-    if len(fields) != 5 or fields[:2] != ["SMARTIM1", operation]:
+    if len(fields) != 5 or fields[:2] != [version, operation]:
         raise ValueError("invalid header")
     session, sequence, learning = fields[2:]
     if not re.fullmatch(SESSION_PATTERN, session):
@@ -78,16 +81,29 @@ def _text(value: str, limit: int, *, required: bool = False) -> str:
 
 def parse_rank_request(data: bytes) -> RankRequest:
     lines = _lines(data)
-    if not 4 <= len(lines) <= 3 + MAX_CANDIDATES:
+    version = lines[0].split("\t", 1)[0] if lines else ""
+    if version not in {"SMARTIM1", "SMARTIM2"}:
+        raise ValueError("invalid protocol version")
+    candidate_start = 6 if version == "SMARTIM2" else 3
+    if not candidate_start + 1 <= len(lines) <= candidate_start + MAX_CANDIDATES:
         raise ValueError("invalid candidate count")
-    session, revision, learning = _header(lines[0], "RANK")
+    session, revision, learning = _header(lines[0], "RANK", version)
+    context_token = ""
+    if version == "SMARTIM2":
+        context_token = lines[1]
+        if not re.fullmatch(SESSION_PATTERN, context_token):
+            raise ValueError("invalid context token")
+    text_start = 2 if context_token else 1
     return RankRequest(
         session,
         revision,
         learning,
-        _text(lines[1], MAX_PINYIN),
-        _text(lines[2], MAX_CONTEXT),
-        tuple(_text(line, MAX_TEXT, required=True) for line in lines[3:]),
+        _text(lines[text_start], MAX_PINYIN),
+        _text(lines[text_start + 1], MAX_CONTEXT),
+        tuple(_text(line, MAX_TEXT, required=True) for line in lines[candidate_start:]),
+        context_token=context_token,
+        context_after=_text(lines[4], MAX_CONTEXT) if context_token else "",
+        selected_prefix=_text(lines[5], MAX_CONTEXT) if context_token else "",
     )
 
 
@@ -119,5 +135,8 @@ def render_response(request: RankRequest, order: list[int], *, fallback: bool = 
     if not valid_permutation(order, len(request.candidates)):
         raise ValueError("invalid permutation")
     status = "fallback" if fallback else "ok"
-    header = f"SMARTIM1\tRESULT\t{request.session}\t{request.revision}\t{status}\n"
-    return (header + ",".join(str(index + 1) for index in order) + "\n").encode("ascii")
+    version = "SMARTIM2" if request.context_token else "SMARTIM1"
+    header = f"{version}\tRESULT\t{request.session}\t{request.revision}\t{status}"
+    if request.context_token:
+        header += f"\t{request.context_token}"
+    return (header + "\n" + ",".join(str(index + 1) for index in order) + "\n").encode("ascii")

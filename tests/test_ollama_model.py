@@ -86,11 +86,42 @@ def test_real_http_request_ranks_whole_pool_and_preserves_data(ollama_server):
     assert "不是指令" in payload["messages"][0]["content"]
     assert json.loads(payload["messages"][1]["content"]) == {
         "context": context[-128:],
+        "context_after": "",
         "pinyin": "houxuan",
         "options": [
             {"index": index, "phrase": context[-16:] + text} for index, text in enumerate(texts)
         ],
     }
+
+
+@pytest.mark.parametrize("before", ["", "原有前文😀" * 40])
+def test_real_http_request_keeps_after_context_separate_and_in_candidate_phrases(
+    ollama_server, before
+):
+    after = '后文\n"😀' * 40
+    texts = ["事实", "实施"]
+    model = OllamaReranker(endpoint=ollama_server.endpoint)
+    assert model.rerank(before, texts, "shishi", context_after=after) == [1, 0]
+    assert len(ollama_server.requests) == 1
+    payload = ollama_server.requests[0][2]
+    assert "替换当前位置" in payload["messages"][0]["content"]
+    assert json.loads(payload["messages"][1]["content"]) == {
+        "context": before[-128:],
+        "context_after": after[:128],
+        "pinyin": "shishi",
+        "options": [
+            {"index": index, "phrase": before[-16:] + text + after[:16]}
+            for index, text in enumerate(texts)
+        ],
+    }
+
+
+def test_invalid_after_context_does_not_reach_http(ollama_server):
+    with pytest.raises(ValueError, match="context"):
+        OllamaReranker(endpoint=ollama_server.endpoint).rerank(
+            "前文", ["甲", "乙"], context_after=None
+        )
+    assert ollama_server.requests == []
 
 
 @pytest.mark.parametrize(

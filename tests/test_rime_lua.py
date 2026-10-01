@@ -43,7 +43,9 @@ class LuaHarness:
               local ctx = {
                 input = 'shishi', caret_pos = 6, refreshes = 0, commit_text = '',
                 options = { smart_im_ai = true, smart_im_learning = false, ascii_mode = false },
-                properties = {}, commit_notifier = notifier(), option_update_notifier = notifier(),
+                properties = { smart_im_context = '1\\tfield-1\\t\\t' },
+                commit_notifier = notifier(), option_update_notifier = notifier(),
+                property_update_notifier = notifier(),
                 update_notifier = notifier(), unhandled_key_notifier = notifier(),
                 segment = { prompt = '', selected_index = 0 }, segments = {},
               }
@@ -53,7 +55,10 @@ class LuaHarness:
                 self.option_update_notifier:emit(self, name)
               end
               function ctx:get_property(name) return self.properties[name] or '' end
-              function ctx:set_property(name, value) self.properties[name] = value end
+              function ctx:set_property(name, value)
+                self.properties[name] = value
+                self.property_update_notifier:emit(self, name)
+              end
               function ctx:get_commit_text() return self.commit_text end
               function ctx:has_menu() return self.input ~= '' end
               function ctx:refresh_non_confirmed_composition()
@@ -166,11 +171,21 @@ class LuaHarness:
         """Simulate Rime rebuilding its translation synchronously on refresh."""
         self.context.refresh_callback = self.filter
 
-    def response(self, order="2,1,3", *, session=None, revision=None, status="ok"):
+    def response(self, order="2,1,3", *, session=None, revision=None, status="ok", token=None):
         request = parse_rank_request(self.request_path.read_bytes())
         self.response_path.write_text(
-            f"SMARTIM1\tRESULT\t{session or self.session}\t"
-            f"{request.revision if revision is None else revision}\t{status}\n{order}\n"
+            f"SMARTIM2\tRESULT\t{session or self.session}\t"
+            f"{request.revision if revision is None else revision}\t{status}\t"
+            f"{request.context_token if token is None else token}\n{order}\n"
+        )
+
+    def property(self, name, value):
+        self.context.set_property(self.context, name, value)
+
+    def tsf_context(self, before="", after="", *, token="field-1"):
+        """Publish an independent frontend snapshot; commits never simulate TSF reads."""
+        self.property(
+            "smart_im_context", f"1\t{token}\t{before.encode().hex()}\t{after.encode().hex()}"
         )
 
     def option(self, name, value):
@@ -361,15 +376,14 @@ def test_update_notifier_cancels_requests_before_any_more_keys_arrive(bridge, ch
 
 
 @pytest.mark.parametrize("flags", [{"ctrl": True}, {"alt": True}, {"super": True}])
-def test_refresh_signal_with_modifiers_does_not_clear_history_or_commit(bridge, flags):
-    bridge.commit("我们计划", "womenjihua")
-    bridge.context.input, bridge.context.caret_pos = "shishi", 6
+def test_refresh_signal_with_modifiers_does_not_clear_tsf_context_or_commit(bridge, flags):
+    bridge.tsf_context("我们计划")
     bridge.filter()
     bridge.response()
     assert bridge.press(**flags) == 1
     assert bridge.press(release=True, **flags) == 1
     assert identities(bridge.displayed) == [2, 1, 3]
-    assert bridge.processor_env.smart_im_state.history == "我们计划"
+    assert bridge.processor_env.smart_im_state.local_context.before == "我们计划"
     assert not list(bridge.directory.glob("*.commit"))
 
 
@@ -402,12 +416,14 @@ def test_malformed_response_is_ignored(bridge, response):
     assert identities(bridge.filter()) == [1, 2, 3]
 
 
-@pytest.mark.parametrize("kind", ["session", "revision", "fallback"])
+@pytest.mark.parametrize("kind", ["session", "revision", "token", "fallback"])
 def test_other_session_old_revision_or_model_fallback_never_reorders(bridge, kind):
     bridge.filter()
     kwargs = {"session": "other"} if kind == "session" else {"revision": 0}
     if kind == "fallback":
         kwargs = {"status": "fallback"}
+    elif kind == "token":
+        kwargs = {"token": "another-field"}
     bridge.response(**kwargs)
     bridge.press()
     assert identities(bridge.filter()) == [1, 2, 3]
@@ -428,8 +444,7 @@ def test_fallback_stays_visible_without_an_automatic_retry_loop(bridge):
 
 @pytest.mark.parametrize("flags", [{}, {"shift": True}, {"release": True}])
 def test_tab_passes_through_without_applying_results_or_clearing_context(bridge, flags):
-    bridge.commit("我们计划", "womenjihua")
-    bridge.context.input, bridge.context.caret_pos = "shishi", 6
+    bridge.tsf_context("我们计划")
     bridge.filter()
     bridge.response()
     refreshes = bridge.context.refreshes
@@ -439,14 +454,13 @@ def test_tab_passes_through_without_applying_results_or_clearing_context(bridge,
     notifier.emit(notifier, bridge.context, key)
     assert identities(bridge.displayed) == [1, 2, 3]
     assert bridge.context.refreshes == refreshes
-    assert bridge.processor_env.smart_im_state.history == "我们计划"
+    assert bridge.processor_env.smart_im_state.local_context.before == "我们计划"
 
 
 @pytest.mark.parametrize("flags", [{"ctrl": True}, {"alt": True}, {"super": True}])
 @pytest.mark.parametrize("unhandled", [False, True])
-def test_tab_shortcuts_pass_through_and_reset_context(bridge, flags, unhandled):
-    bridge.commit("我们计划", "womenjihua")
-    bridge.context.input, bridge.context.caret_pos = "shishi", 6
+def test_tab_shortcuts_pass_through_and_invalidate_rank_snapshot(bridge, flags, unhandled):
+    bridge.tsf_context("我们计划")
     bridge.filter()
     bridge.response()
     refreshes = bridge.context.refreshes
@@ -459,7 +473,7 @@ def test_tab_shortcuts_pass_through_and_reset_context(bridge, flags, unhandled):
         assert bridge.press(0xFF09, release=True, **flags) == 2
     assert identities(bridge.displayed) == [1, 2, 3]
     assert bridge.context.refreshes == refreshes
-    assert bridge.processor_env.smart_im_state.history == ""
+    assert bridge.processor_env.smart_im_state.snapshot is None
     assert not bridge.request_path.exists()
     assert not bridge.response_path.exists()
 
@@ -483,8 +497,7 @@ def test_identity_result_without_context_does_not_claim_ai_ranking(bridge):
 
 
 def test_identity_result_with_context_can_recommend_the_existing_first_candidate(bridge):
-    bridge.commit("我们计划", "womenjihua")
-    bridge.context.input, bridge.context.caret_pos = "shishi", 6
+    bridge.tsf_context("我们计划")
     bridge.filter()
     bridge.response("1,2,3")
     bridge.press()
@@ -612,6 +625,7 @@ def test_timeout_is_visible_without_starving_late_response(bridge):
 def test_request_pinyin_uses_the_candidates_shared_segment(bridge):
     bridge.context.input = "woshishi"
     bridge.context.caret_pos = 8
+    bridge.set_segments(("我", 0, 2, "kSelected"))
     bridge.filter(bridge.make_candidates(["事实", "实时"], start=2, finish=8))
     assert parse_rank_request(bridge.request_path.read_bytes()).pinyin == "shishi"
 
@@ -624,7 +638,7 @@ def test_request_pinyin_uses_the_candidates_shared_segment(bridge):
         ("解决", "jiejue", "fangan", ["反感", "方案"]),
     ],
 )
-def test_selected_uncommitted_prefix_is_sent_as_context(
+def test_selected_uncommitted_prefix_is_sent_separately_from_body(
     bridge, status, prefix, spelling, pinyin, texts
 ):
     bridge.option("smart_im_learning", True)
@@ -634,19 +648,22 @@ def test_selected_uncommitted_prefix_is_sent_as_context(
     bridge.filter(bridge.make_candidates(texts, start=len(spelling), finish=len(spelling + pinyin)))
     request = parse_rank_request(bridge.request_path.read_bytes())
     assert request.pinyin == pinyin
-    assert request.context == prefix
+    assert request.context == ""
+    assert request.selected_prefix == prefix
     assert request.candidates == tuple(texts)
     assert not list(bridge.directory.glob("*.commit"))
-    assert bridge.processor_env.smart_im_state.history == ""
 
 
-def test_prefix_combines_multiple_selected_segments_and_committed_history(bridge):
-    bridge.commit("我们", "women")
+def test_prefix_keeps_multiple_selected_segments_separate_from_tsf_body(bridge):
+    bridge.tsf_context("我们", "这项计划")
     bridge.context.input = "jihuaquanshishishi"
     bridge.context.caret_pos = len(bridge.context.input)
     bridge.set_segments(("计划", 0, 5, "kConfirmed"), ("全市", 5, 11, "kSelected"))
     bridge.filter(bridge.make_candidates(["实施", "实时"], start=11, finish=17))
-    assert parse_rank_request(bridge.request_path.read_bytes()).context == "我们计划全市"
+    request = parse_rank_request(bridge.request_path.read_bytes())
+    assert request.context == "我们"
+    assert request.context_after == "这项计划"
+    assert request.selected_prefix == "计划全市"
 
 
 def test_active_candidate_is_never_read_or_included_in_its_own_context(bridge):
@@ -657,7 +674,7 @@ def test_active_candidate_is_never_read_or_included_in_its_own_context(bridge):
         "function() error('active menu recursively requested') end"
     )
     bridge.filter(bridge.make_candidates(["展示", "战士"], start=6, finish=13))
-    assert parse_rank_request(bridge.request_path.read_bytes()).context == "铁血"
+    assert parse_rank_request(bridge.request_path.read_bytes()).selected_prefix == "铁血"
     bridge.response("2,1")
     bridge.press()
     assert identities(bridge.filter()) == [2, 1]
@@ -681,30 +698,38 @@ def test_changed_selected_prefix_invalidates_ready_result_before_notification(br
     bridge.enable_refresh()
     bridge.press()
     assert identities(bridge.filter()) == [1, 2]
+    if change != "text":
+        assert not bridge.request_path.exists()
+        assert not bridge.response_path.exists()
+        assert "无法AI排序" in bridge.context.segment.prompt
+        return
     request = parse_rank_request(bridge.request_path.read_bytes())
     assert request.revision > previous
-    assert request.context == ("贴血" if change == "text" else "")
+    assert request.selected_prefix == "贴血"
     bridge.response("2,1")
     bridge.press()
     assert identities(bridge.filter()) == [2, 1]
 
 
 def test_selected_prefix_remains_bounded_and_is_not_duplicated_after_commit(bridge):
-    bridge.commit("你" * 64)
-    bridge.commit("😀" * 64)
+    bridge.tsf_context("你" * 64 + "😀" * 64)
     bridge.context.input = "tiexuezhanshi"
     bridge.context.caret_pos = 13
     bridge.set_segments(("铁血", 0, 6, "kConfirmed"))
     bridge.filter(bridge.make_candidates(["展示", "战士"], start=6, finish=13))
     request = parse_rank_request(bridge.request_path.read_bytes())
-    assert request.context == "你" * 62 + "😀" * 64 + "铁血"
+    assert request.context == "你" * 64 + "😀" * 64
+    assert request.selected_prefix == "铁血"
     bridge.commit("铁血战士", "tiexuezhanshi")
     bridge.set_segments()
     bridge.context.input = "shishi"
     bridge.context.caret_pos = 6
+    # TSF, not the commit notifier, supplies the changed document text.
+    bridge.tsf_context("你" * 60 + "😀" * 64 + "铁血战士", token="field-2")
     bridge.filter(bridge.make_candidates(["事实", "实时"]))
     request = parse_rank_request(bridge.request_path.read_bytes())
     assert request.context == "你" * 60 + "😀" * 64 + "铁血战士"
+    assert request.selected_prefix == ""
 
 
 def test_service_started_after_existing_menu_is_requested_on_next_filter(tmp_path):
@@ -799,7 +824,8 @@ def test_top_nine_are_bounded_and_remainder_untouched(bridge):
 
 
 def test_commit_learning_requires_explicit_switch_and_uses_precommit_context(bridge):
-    bridge.commit("尊重", "zunzhong")
+    bridge.tsf_context("尊重")
+    bridge.filter()
     assert not list(bridge.directory.glob("*.commit"))
     bridge.option("smart_im_learning", True)
     bridge.commit("事实")
@@ -815,9 +841,11 @@ def test_commit_learning_requires_explicit_switch_and_uses_precommit_context(bri
     assert len(list(bridge.directory.glob("*.commit"))) == 1
 
 
-@pytest.mark.parametrize("reason", ["escape", "left", "shortcut", "unhandled", "ttl", "app"])
-def test_session_context_is_conservatively_reset(bridge, reason):
-    bridge.commit("尊重", "zunzhong")
+@pytest.mark.parametrize("reason", ["escape", "left", "shortcut", "unhandled", "app"])
+def test_navigation_and_app_changes_cancel_current_rank(bridge, reason):
+    bridge.tsf_context("尊重")
+    bridge.filter()
+    bridge.response()
     if reason == "escape":
         bridge.press(0xFF1B)
     elif reason == "left":
@@ -828,23 +856,19 @@ def test_session_context_is_conservatively_reset(bridge, reason):
         key = bridge.lua.globals().make_key(ord("x"), bridge.lua.table())
         n = bridge.context.unhandled_key_notifier
         n.emit(n, bridge.context, key)
-    elif reason == "ttl":
-        bridge.lua.globals().now += 31
-        bridge.heartbeat()
     else:
-        bridge.context.properties.client_app = "another.exe"
-    bridge.context.input = "shishi"
-    bridge.context.caret_pos = 6
-    bridge.filter()
-    assert parse_rank_request(bridge.request_path.read_bytes()).context == ""
+        bridge.property("client_app", "another.exe")
+    assert not bridge.request_path.exists()
+    assert not bridge.response_path.exists()
+    assert bridge.processor_env.smart_im_state.snapshot is None
 
 
 def test_unicode_context_is_bounded_without_splitting_multibyte_characters(bridge):
-    for text in ["你" * 64, "😀" * 64, "好"]:
-        bridge.commit(text)
+    bridge.tsf_context("你" * 63 + "😀" * 64 + "好", "后" * 128)
     bridge.filter()
     context = parse_rank_request(bridge.request_path.read_bytes()).context
     assert context == "你" * 63 + "😀" * 64 + "好"
+    assert parse_rank_request(bridge.request_path.read_bytes()).context_after == "后" * 128
 
 
 @pytest.mark.parametrize("field", ["pinyin", "candidate"])
@@ -876,6 +900,7 @@ def test_component_cleanup_disconnects_notifiers_only_after_last_reference(bridg
             bridge.context.commit_notifier,
             bridge.context.update_notifier,
             bridge.context.option_update_notifier,
+            bridge.context.property_update_notifier,
             bridge.context.unhandled_key_notifier,
         ]
         for connection in notifier.connections.values()
@@ -887,6 +912,133 @@ def test_sessions_are_isolated_in_one_lua_vm(bridge):
     env = bridge.lua.table_from({"engine": bridge.lua.table_from({"context": other})})
     bridge.module.processor.init(env)
     assert other.properties.smart_im_session != bridge.session
-    bridge.commit("尊重")
-    assert env.smart_im_state.history == ""
+    bridge.tsf_context("尊重")
+    assert env.smart_im_state.local_context.before == ""
     bridge.module.processor.fini(env)
+
+
+def test_existing_document_text_and_suffix_are_read_without_any_commit(bridge):
+    bridge.tsf_context("原来的正文：我们计划", "这项方案。", token="doc-5-selection-17")
+    bridge.filter()
+    request = parse_rank_request(bridge.request_path.read_bytes())
+    assert request.context == "原来的正文：我们计划"
+    assert request.context_after == "这项方案。"
+    assert request.selected_prefix == ""
+    assert request.context_token == "doc-5-selection-17"
+    assert not list(bridge.directory.glob("*.commit"))
+
+
+@pytest.mark.parametrize("change", ["token", "before", "after", "focus", "malformed"])
+def test_tsf_change_immediately_restores_native_menu_and_rejects_late_result(bridge, change):
+    bridge.tsf_context("我们计划", "这项方案", token="field-1")
+    bridge.filter()
+    bridge.response()
+    stale_response = bridge.response_path.read_bytes()
+    previous = parse_rank_request(bridge.request_path.read_bytes()).revision
+    bridge.press()
+    assert identities(bridge.displayed) == [2, 1, 3]
+    if change == "focus":
+        bridge.property("smart_im_context", "")
+    elif change == "malformed":
+        bridge.property("smart_im_context", "broken")
+    else:
+        bridge.tsf_context(
+            "他们计划" if change == "before" else "我们计划",
+            "那项方案" if change == "after" else "这项方案",
+            token="field-2" if change == "token" else "field-1",
+        )
+    # No key, Rime update notifier, or filter call is needed for invalidation.
+    assert identities(bridge.displayed) == [1, 2, 3]
+    assert bridge.context.segment.prompt == ""
+    assert not bridge.request_path.exists()
+    assert not bridge.response_path.exists()
+    assert bridge.processor_env.smart_im_state.snapshot is None
+    bridge.response_path.write_bytes(stale_response)
+    bridge.press()
+    assert identities(bridge.displayed) == [1, 2, 3]
+    assert "AI 推荐" not in bridge.context.segment.prompt
+    bridge.filter()
+    if change in {"focus", "malformed"}:
+        assert not bridge.request_path.exists()
+    else:
+        current = parse_rank_request(bridge.request_path.read_bytes())
+        assert current.revision > previous
+        bridge.response_path.write_bytes(stale_response)
+        bridge.press()
+        assert identities(bridge.displayed) == [1, 2, 3]
+
+
+def test_unchanged_atomic_tsf_property_does_not_cancel_pending_request(bridge):
+    bridge.tsf_context("正文", "后文")
+    bridge.filter()
+    request = bridge.request_path.read_bytes()
+    refreshes = bridge.context.refreshes
+    bridge.tsf_context("正文", "后文")
+    assert bridge.request_path.read_bytes() == request
+    assert bridge.context.refreshes == refreshes
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "1\tmissing-fields",
+        "2\tfield\t\t",
+        "1\tfield\ta\t",
+        "1\tfield\tff\t",
+        "1\tfield\ted a080\t",
+        "1\tfield\teda080\t",
+        "1\tinvalid token\t\t",
+        f"1\t{'x' * 65}\t\t",
+        "1\tfield\t\t\textra",
+        f"1\tfield\t{('你' * 129).encode().hex()}\t",
+        f"1\tfield\t\t{('😀' * 129).encode().hex()}",
+    ],
+)
+def test_missing_or_invalid_tsf_context_preserves_rime_without_history_fallback(bridge, value):
+    bridge.property("smart_im_context", value)
+    bridge.option("smart_im_learning", True)
+    bridge.commit("之前上屏的文字")
+    assert identities(bridge.filter()) == [1, 2, 3]
+    assert not bridge.request_path.exists()
+    assert not list(bridge.directory.glob("*.commit"))
+    assert "未获取到局部上下文" in bridge.context.segment.prompt
+
+
+def test_commit_does_not_accumulate_text_or_duplicate_selected_prefix_in_learning(bridge):
+    bridge.option("smart_im_learning", True)
+    bridge.tsf_context("原有的", "。")
+    bridge.context.input, bridge.context.caret_pos = "tiexuezhanshi", 13
+    bridge.set_segments(("铁血", 0, 6, "kSelected"))
+    bridge.filter(bridge.make_candidates(["展示", "战士"], start=6, finish=13))
+    request = parse_rank_request(bridge.request_path.read_bytes())
+    assert request.context == "原有的"
+    assert request.selected_prefix == "铁血"
+    bridge.commit("铁血战士", "tiexuezhanshi")
+    event = parse_commit_event(next(bridge.directory.glob("*.commit")).read_bytes())
+    assert event.context == "原有的"
+    assert event.text == "铁血战士"
+    assert bridge.processor_env.smart_im_state.snapshot is None
+    assert bridge.processor_env.smart_im_state.local_context.before == "原有的"
+
+
+@pytest.mark.parametrize("invalid", ["missing", "gap", "unfinished", "candidate_range"])
+def test_unknown_composition_prefix_never_splices_document_body_onto_candidate(bridge, invalid):
+    bridge.tsf_context("正文")
+    bridge.context.input, bridge.context.caret_pos = "tiexuezhanshi", 13
+    if invalid != "missing":
+        bridge.set_segments(
+            (
+                "铁血",
+                1 if invalid == "gap" else 0,
+                6,
+                "kGuess" if invalid == "unfinished" else "kSelected",
+            )
+        )
+        if invalid == "candidate_range":
+            bridge.context.segments[1].candidate._end = 5
+    assert identities(
+        bridge.filter(bridge.make_candidates(["展示", "战士"], start=6, finish=13))
+    ) == [1, 2]
+    assert not bridge.request_path.exists()
+    assert "无法AI排序" in bridge.context.segment.prompt

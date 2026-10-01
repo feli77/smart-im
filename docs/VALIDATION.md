@@ -1,6 +1,31 @@
 # 验证记录
 
-记录日期：2026-09-30。以下保留已有模型诊断和原生 Rime 验证证据；命令已调整为当前默认使用 Ollama 的接口，不表示重新运行了这些实测。
+## 2026-10-01：TSF 局部上下文重构
+
+本次以小狼毫官方 0.17.4 固定提交为基础开发，源码补丁与复现步骤见 [TSF 扩展](TSF.md)。测试未替换系统输入法，未修改实际 Rime 用户目录。
+
+- Python / 真实 Lua / 文件信箱全量测试 **460 passed**。新增测试覆盖原有正文直接读取接口、独立后文、已选分段只拼接一次、未知前缀拒绝、同文不同 token、切换输入框的立即失效及模型计算期间取消。现有候选对象、混合范围、个人学习和失败回退测试保留。
+- Windows 原生 `ITfRange` COM 测试执行实际局部读取 helper：已有正文、整个 composition/占位空格排除、覆盖选区、两侧 128 UTF-16 单元和 region 边界、代理对截断、失败或短读回退通过。text store 由测试实现，不代表真实应用 TSF 验收。
+- 原生 packet parser 与真实 Win32 named-pipe 测试通过。管道测试编译实际 `PipeChannel.cpp`，验证两连接并发隔离、完整 token/正文、缺失正文和短 header 拒绝、上下文通知不覆盖尚未消费的按键响应。
+- 本机 MSVC 2022 对修改的 TSF、IPC 和 Rime 桥接源文件完成对象文件编译；这不是最终 DLL/EXE 链接或安装包验证。
+- 只读加载已安装小狼毫 0.17.4 的 `rime.dll`，在每次新建的隔离目录运行 Lua 属性探针：`property_update_notifier` 可用；回调内已可读到完整新值；空属性和同值发布均触发通知。仓库提供 `scripts/check_librime_property.py` 复现，所有生成内容写入 `artifacts`。
+- Ruff、格式检查、锁文件检查和 Python wheel/sdist 构建通过。此轮未重跑真实 Qwen 语义评测。
+
+**尚未完成：** 小狼毫完整二进制链接/安装，以及记事本、浏览器多输入框、富文本编辑器的真实 TSF → Rime → 服务 → 候选窗口验收。三项重点行为已由分层自动化测试覆盖；真实应用支持与焦点通知时序仍需按 [专项验收表](TSF.md#真实应用验收) 记录，不能把模拟 text store 结果当作实机证明。
+
+```powershell
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv lock --check
+uv build
+./scripts/verify_weasel_native.ps1 -BoostRoot ./artifacts/native-deps/boost_1_84_0 -CompileSources
+uv run python scripts/check_librime_property.py --rime-dir "C:/Program Files/Rime/weasel-0.17.4"
+```
+
+## 2026-09-30 及更早记录
+
+以下保留已有模型诊断和原生 Rime 验证证据；其中“上屏历史”、400 tests 和旧部署说明描述重构前版本，不代表本次 TSF 补丁已经完成实机验证。
 
 ## 自动更新与推荐高亮
 
@@ -79,4 +104,4 @@ uv run smart-im install-rime --force
 uv run smart-im serve
 ```
 
-按 [Rime 使用说明](RIME.md) 复测用户两例、连续输入、取消/删除、部分选词、Tab 和数字选词，以及多应用/控件切换。仍需独立真实候选评测集、完整链路延迟及 Windows 文件竞争验收；目前的有限会话历史不能等同于编辑位置周围的完整正文。
+按 [Rime 使用说明](RIME.md) 复测用户两例、连续输入、取消/删除、部分选词、Tab 和数字选词，以及多应用/控件切换。仍需独立真实候选评测集、完整链路延迟及 Windows 文件竞争验收；此前的有限会话历史不能等同于编辑位置周围的正文，现已由上述 TSF 局部读取替换。

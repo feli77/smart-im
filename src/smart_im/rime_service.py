@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from .engine import Engine
 from .rime_protocol import (
     MAX_BYTES,
+    MAX_CONTEXT,
     SESSION_PATTERN,
     parse_commit_event,
     parse_rank_request,
@@ -206,7 +207,8 @@ class MailboxService:
         try:
             order = self.engine.rerank(
                 list(request.candidates),
-                context=request.context,
+                context=(request.context + request.selected_prefix)[-MAX_CONTEXT:],
+                context_after=request.context_after,
                 pinyin=request.pinyin,
                 private=not (self.engine.learning and request.learning),
             )

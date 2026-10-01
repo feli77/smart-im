@@ -103,3 +103,42 @@ def test_context_manager_closes_store_on_error_and_close_is_idempotent(tmp_path)
     engine.close()
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         store.stats()
+
+
+@pytest.mark.parametrize("before", ["", "前" * 200])
+def test_model_receives_bounded_context_on_both_sides_even_without_before_text(tmp_path, before):
+    calls = []
+
+    class InsertionModel:
+        name = "insertion-test"
+
+        def rerank(self, context, texts, pinyin="", context_after=""):
+            calls.append((context, texts, pinyin, context_after))
+            return [1, 0]
+
+    after = "之后的文档" * 40
+    with Engine(tmp_path, InsertionModel()) as engine:
+        assert engine.rerank(["事实", "实施"], before, "shishi", context_after=after) == [1, 0]
+        assert engine.model_error == ""
+    assert calls == [(before[-128:], ["事实", "实施"], "shishi", after[:128])]
+
+
+def test_after_context_is_not_used_for_personal_context_lookup(tmp_path, monkeypatch):
+    class InsertionModel(FlatModel):
+        def rerank(self, context, texts, pinyin="", context_after=""):
+            return [0, 1]
+
+    with Engine(tmp_path, InsertionModel(), learning=True) as engine:
+        store = engine._personal()
+        contexts = []
+        monkeypatch.setattr(store, "context_counts", lambda context: contexts.append(context) or {})
+        engine.rerank(["事实", "实施"], "前文", "shishi", context_after="后文")
+        engine.rerank(["事实", "实施"], "", "shishi", context_after="后文")
+        assert contexts == ["前文"]
+        assert engine.stats()["selections"] == 0
+
+
+def test_invalid_after_context_is_rejected(tmp_path):
+    with Engine(tmp_path, FlatModel()) as engine:
+        with pytest.raises(ValueError, match="context"):
+            engine.rerank(["事实", "实施"], context_after=None)

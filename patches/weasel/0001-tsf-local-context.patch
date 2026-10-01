@@ -1,0 +1,1904 @@
+From a89a78e8d44af3bb793c17cab045cd437f35f0c8 Mon Sep 17 00:00:00 2001
+From: felix07 <l.shuheng@stu.xjtu.edu.cn>
+Date: Thu, 1 Oct 2026 13:13:12 +0800
+Subject: [PATCH] feat(tsf): publish local document context for Smart IM
+
+---
+ RimeWithWeasel/RimeWithWeasel.cpp    |  25 +++
+ WeaselIPC/PipeChannel.cpp            |  18 ++-
+ WeaselIPC/WeaselClientImpl.cpp       |  25 ++-
+ WeaselIPC/WeaselClientImpl.h         |   6 +-
+ WeaselIPCServer/WeaselServerImpl.cpp |  58 +++++--
+ WeaselIPCServer/WeaselServerImpl.h   |   3 +
+ WeaselTSF/Composition.cpp            |  62 ++++++-
+ WeaselTSF/DisplayAttribute.cpp       |   5 +-
+ WeaselTSF/EditSession.h              |   9 +-
+ WeaselTSF/KeyEventSink.cpp           |  17 +-
+ WeaselTSF/LocalContext.cpp           | 177 ++++++++++++++++++++
+ WeaselTSF/LocalContext.h             |  80 +++++++++
+ WeaselTSF/TextEditSink.cpp           |  82 ++++------
+ WeaselTSF/ThreadMgrEventSink.cpp     |  36 +++--
+ WeaselTSF/WeaselTSF.cpp              |   7 +
+ WeaselTSF/WeaselTSF.h                |  36 ++++-
+ WeaselTSF/WeaselTSF.vcxproj          |   2 +
+ WeaselTSF/WeaselTSF.vcxproj.filters  |   6 +
+ WeaselTSF/tests/LocalContextTest.cpp | 183 +++++++++++++++++++++
+ include/PipeChannel.h                |   6 +
+ include/RimeWithWeasel.h             |   1 +
+ include/SmartIMContext.h             |  53 ++++++
+ include/WeaselIPC.h                  |   6 +
+ test/SmartIMContextTest.cpp          |  96 +++++++++++
+ test/SmartIMPipeTest.cpp             | 234 +++++++++++++++++++++++++++
+ 25 files changed, 1141 insertions(+), 92 deletions(-)
+ create mode 100644 WeaselTSF/LocalContext.cpp
+ create mode 100644 WeaselTSF/LocalContext.h
+ create mode 100644 WeaselTSF/tests/LocalContextTest.cpp
+ create mode 100644 include/SmartIMContext.h
+ create mode 100644 test/SmartIMContextTest.cpp
+ create mode 100644 test/SmartIMPipeTest.cpp
+
+diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
+index 3f4e59d..2a6dcc0 100644
+--- a/RimeWithWeasel/RimeWithWeasel.cpp
++++ b/RimeWithWeasel/RimeWithWeasel.cpp
+@@ -1,6 +1,7 @@
+ ﻿#include "stdafx.h"
+ #include <logging.h>
+ #include <RimeWithWeasel.h>
++#include <SmartIMContext.h>
+ #include <StringAlgorithm.hpp>
+ #include <WeaselConstants.h>
+ #include <WeaselUtility.h>
+@@ -385,6 +386,29 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
+   return res;
+ }
+ 
++bool RimeWithWeaselHandler::UpdateLocalContext(const std::wstring& packet,
++                                              WeaselSessionId ipc_id) {
++  auto found = m_session_status_map.find(ipc_id);
++  if (m_disabled || found == m_session_status_map.end())
++    return false;
++  const auto session_id = found->second.session_id;
++  if (!_IsSessionTSF(session_id))
++    return false;
++  const bool valid = smart_im::ValidPacket(packet);
++  // ASCII framing is intentional: document text is UTF-8 hex, never logged.
++  const std::string value = valid ? std::string(packet.begin(), packet.end()) : "";
++  char previous[smart_im::kMaxPacket + 1] = {};
++  if (rime_api->get_property(session_id, "smart_im_context", previous, sizeof(previous)) &&
++      value == previous)
++    return valid;
++  rime_api->set_property(session_id, "smart_im_context", value.c_str());
++  // Lua's property notifier has now removed stale requests/results and rebuilt
++  // its original candidates. Refresh the server-owned candidate window too.
++  if (m_active_session == ipc_id)
++    _UpdateUI(ipc_id);
++  return valid;
++}
++
+ void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
+   DLOG(INFO) << "Focus in: ipc_id = " << ipc_id
+              << ", client_caps = " << client_caps;
+@@ -395,6 +419,7 @@ void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
+ }
+ 
+ void RimeWithWeaselHandler::FocusOut(DWORD param, WeaselSessionId ipc_id) {
++  UpdateLocalContext(L"", ipc_id);
+   DLOG(INFO) << "Focus out: ipc_id = " << ipc_id;
+   if (m_ui)
+     m_ui->Hide();
+diff --git a/WeaselIPC/PipeChannel.cpp b/WeaselIPC/PipeChannel.cpp
+index c3912a5..91da486 100644
+--- a/WeaselIPC/PipeChannel.cpp
++++ b/WeaselIPC/PipeChannel.cpp
+@@ -99,18 +99,23 @@ void PipeChannelBase::_FinalizePipe(HANDLE& p) {
+ }
+ 
+ void PipeChannelBase::_Receive(HANDLE pipe, LPVOID msg, size_t rec_len) {
++  received_body_size = 0;
++  has_body = false;
+   DWORD lread;
+   BOOL success = ::ReadFile(pipe, msg, rec_len, &lread, NULL);
+   if (!success) {
+     _ThrowIfNot(ERROR_MORE_DATA);
+-
++    if (lread != rec_len)
++      _ThrowCode(static_cast<DWORD>(ERROR_INVALID_DATA));
+     memset(buffer.get(), 0, buff_size);
+     success = ::ReadFile(pipe, buffer.get(), buff_size, &lread, NULL);
+     if (!success) {
+       _ThrowLastError;
+     }
++    received_body_size = lread;
++  } else if (lread != rec_len) {
++    _ThrowCode(static_cast<DWORD>(ERROR_INVALID_DATA));
+   }
+-  has_body = false;
+ }
+ 
+ HANDLE PipeChannelBase::_ConnectServerPipe(std::wstring& pn) {
+@@ -118,8 +123,15 @@ HANDLE PipeChannelBase::_ConnectServerPipe(std::wstring& pn) {
+       CreateNamedPipe(pn.c_str(), PIPE_ACCESS_DUPLEX,
+                       PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                       PIPE_UNLIMITED_INSTANCES, buff_size, buff_size, 0, sa);
+-  if (pipe == INVALID_HANDLE_VALUE || !::ConnectNamedPipe(pipe, NULL)) {
++  if (pipe == INVALID_HANDLE_VALUE)
+     _ThrowLastError;
++  if (!::ConnectNamedPipe(pipe, NULL)) {
++    const DWORD error = GetLastError();
++    // A client can connect between CreateNamedPipe and ConnectNamedPipe.
++    if (error != ERROR_PIPE_CONNECTED) {
++      CloseHandle(pipe);
++      throw error;
++    }
+   }
+   return pipe;
+ }
+diff --git a/WeaselIPC/WeaselClientImpl.cpp b/WeaselIPC/WeaselClientImpl.cpp
+index 26122ad..87d2667 100644
+--- a/WeaselIPC/WeaselClientImpl.cpp
++++ b/WeaselIPC/WeaselClientImpl.cpp
+@@ -1,11 +1,15 @@
+ ﻿#include "stdafx.h"
+ #include "WeaselClientImpl.h"
+ #include <StringAlgorithm.hpp>
++#include <SmartIMContext.h>
+ 
+ using namespace weasel;
+ 
+ ClientImpl::ClientImpl()
+-    : session_id(0), channel(GetPipeName()), is_ime(false) {
++    : session_id(0),
++      is_ime(false),
++      channel(GetPipeName()),
++      context_channel(GetPipeName(), nullptr, WEASEL_IPC_BUFFER_SIZE) {
+   _InitializeClientInfo();
+ }
+ 
+@@ -49,6 +53,7 @@ void ClientImpl::Disconnect() {
+   if (_Active())
+     EndSession();
+   channel.Disconnect();
++  context_channel.Disconnect();
+ }
+ 
+ void ClientImpl::ShutdownServer() {
+@@ -138,6 +143,20 @@ void ClientImpl::FocusOut() {
+   _SendMessage(WEASEL_IPC_FOCUS_OUT, 0, session_id);
+ }
+ 
++bool ClientImpl::UpdateLocalContext(const std::wstring& packet) {
++  if (!_Active() || !smart_im::ValidPacket(packet))
++    return false;
++  try {
++    context_channel << packet.c_str() << L'\0';
++    PipeMessage request{WEASEL_IPC_UPDATE_LOCAL_CONTEXT,
++                        static_cast<DWORD>(packet.size()), session_id};
++    return context_channel.Transact(request) != 0;
++  } catch (DWORD) {
++    context_channel.ClearBufferStream();
++    return false;
++  }
++}
++
+ void ClientImpl::TrayCommand(UINT menuId) {
+   _SendMessage(WEASEL_IPC_TRAY_COMMAND, menuId, session_id);
+ }
+@@ -256,6 +275,10 @@ void Client::FocusOut() {
+   m_pImpl->FocusOut();
+ }
+ 
++bool Client::UpdateLocalContext(const std::wstring& packet) {
++  return m_pImpl->UpdateLocalContext(packet);
++}
++
+ void Client::StartSession() {
+   m_pImpl->StartSession();
+ }
+diff --git a/WeaselIPC/WeaselClientImpl.h b/WeaselIPC/WeaselClientImpl.h
+index 7602792..e93cdcd 100644
+--- a/WeaselIPC/WeaselClientImpl.h
++++ b/WeaselIPC/WeaselClientImpl.h
+@@ -26,6 +26,7 @@ class ClientImpl {
+   void UpdateInputPosition(RECT const& rc);
+   void FocusIn();
+   void FocusOut();
++  bool UpdateLocalContext(const std::wstring& packet);
+   void TrayCommand(UINT menuId);
+   bool GetResponseData(ResponseHandler const& handler);
+ 
+@@ -44,6 +45,9 @@ class ClientImpl {
+   bool is_ime;
+ 
+   PipeChannel<PipeMessage> channel;
++  // Context notifications must not overwrite a key response waiting for an
++  // asynchronous TSF edit session to consume it.
++  PipeChannel<PipeMessage> context_channel;
+ };
+ 
+-}  // namespace weasel
+\ No newline at end of file
++}  // namespace weasel
+diff --git a/WeaselIPCServer/WeaselServerImpl.cpp b/WeaselIPCServer/WeaselServerImpl.cpp
+index 11225c4..b295e50 100644
+--- a/WeaselIPCServer/WeaselServerImpl.cpp
++++ b/WeaselIPCServer/WeaselServerImpl.cpp
+@@ -4,13 +4,14 @@
+ #include <Windows.h>
+ #include <resource.h>
+ #include <WeaselUtility.h>
++#include <SmartIMContext.h>
+ 
+ namespace weasel {
+ class PipeServer : public PipeChannel<DWORD, PipeMessage> {
+  public:
+   using ServerRunner = std::function<void()>;
+   using Respond = std::function<void(Msg)>;
+-  using ServerHandler = std::function<void(PipeMessage, Respond)>;
++  using ServerHandler = std::function<void(PipeMessage, PipeServer&, Respond)>;
+ 
+   PipeServer(std::wstring&& pn_cmd, SECURITY_ATTRIBUTES* s);
+ 
+@@ -171,9 +172,17 @@ int ServerImpl::Run() {
+   // auto handler = boost::bind(&ServerImpl::HandlePipeMessage, this);
+   // auto listener = boost::bind(&PipeServer::Listen, channel.get(), handler);
+   //
+-  auto listener = [this](PipeMessage msg, PipeServer::Respond resp) -> void {
++  auto listener = [this](PipeMessage msg, PipeServer& connection,
++                         PipeServer::Respond resp) -> void {
+     std::lock_guard guard(g_api_mutex);
+-    HandlePipeMessage(msg, resp);
++    request_channel = &connection;
++    try {
++      HandlePipeMessage(msg, resp);
++    } catch (...) {
++      request_channel = nullptr;
++      throw;
++    }
++    request_channel = nullptr;
+   };
+   pipeThread = std::make_unique<boost::thread>(
+       [this, &listener]() { channel->Listen(listener); });
+@@ -196,10 +205,15 @@ DWORD ServerImpl::OnStartSession(WEASEL_IPC_COMMAND uMsg,
+                                  DWORD lParam) {
+   if (!m_pRequestHandler)
+     return 0;
++  const auto bytes = request_channel->ReceivedBodySize();
++  const auto buffer = reinterpret_cast<LPWSTR>(request_channel->ReceivedBody());
++  if (bytes < sizeof(wchar_t) || bytes % sizeof(wchar_t) ||
++      !wmemchr(buffer, L'\0', bytes / sizeof(wchar_t)))
++    return 0;
+   return m_pRequestHandler->AddSession(
+-      reinterpret_cast<LPWSTR>(channel->ReceiveBuffer()),
++      buffer,
+       [this](std::wstring& msg) -> bool {
+-        *channel << msg;
++        *request_channel << msg;
+         return true;
+       });
+ }
+@@ -219,7 +233,7 @@ DWORD ServerImpl::OnKeyEvent(WEASEL_IPC_COMMAND uMsg,
+     return 0;
+ 
+   auto eat = [this](std::wstring& msg) -> bool {
+-    *channel << msg;
++    *request_channel << msg;
+     return true;
+   };
+   return m_pRequestHandler->ProcessKeyEvent(KeyEvent(wParam), lParam, eat);
+@@ -232,6 +246,25 @@ DWORD ServerImpl::OnShutdownServer(WEASEL_IPC_COMMAND uMsg,
+   return 0;
+ }
+ 
++DWORD ServerImpl::OnUpdateLocalContext(WEASEL_IPC_COMMAND,
++                                      DWORD length,
++                                      DWORD session) {
++  if (!m_pRequestHandler)
++    return 0;
++  // Never inspect an unbounded, possibly unterminated pipe body.
++  if (length > smart_im::kMaxPacket ||
++      request_channel->ReceivedBodySize() < (length + 1) * sizeof(wchar_t)) {
++    m_pRequestHandler->UpdateLocalContext(L"", session);
++    return 0;
++  }
++  const auto buffer = reinterpret_cast<const wchar_t*>(request_channel->ReceivedBody());
++  if (buffer[length] != L'\0') {
++    m_pRequestHandler->UpdateLocalContext(L"", session);
++    return 0;
++  }
++  return m_pRequestHandler->UpdateLocalContext(std::wstring(buffer, length), session);
++}
++
+ DWORD ServerImpl::OnFocusIn(WEASEL_IPC_COMMAND uMsg,
+                             DWORD wParam,
+                             DWORD lParam) {
+@@ -337,7 +370,7 @@ DWORD ServerImpl::OnHighlightCandidateOnCurrentPage(WEASEL_IPC_COMMAND uMsg,
+                                                     DWORD lParam) {
+   if (m_pRequestHandler) {
+     auto eat = [this](std::wstring& msg) -> bool {
+-      *channel << msg;
++      *request_channel << msg;
+       return true;
+     };
+     m_pRequestHandler->HighlightCandidateOnCurrentPage(wParam, lParam, eat);
+@@ -350,7 +383,7 @@ DWORD ServerImpl::OnChangePage(WEASEL_IPC_COMMAND uMsg,
+                                DWORD lParam) {
+   if (m_pRequestHandler) {
+     auto eat = [this](std::wstring& msg) -> bool {
+-      *channel << msg;
++      *request_channel << msg;
+       return true;
+     };
+     m_pRequestHandler->ChangePage(wParam, lParam, eat);
+@@ -386,6 +419,7 @@ void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg, _Resp resp) {
+   PIPE_MSG_HANDLE(WEASEL_IPC_SHUTDOWN_SERVER, OnShutdownServer)
+   PIPE_MSG_HANDLE(WEASEL_IPC_FOCUS_IN, OnFocusIn)
+   PIPE_MSG_HANDLE(WEASEL_IPC_FOCUS_OUT, OnFocusOut)
++  PIPE_MSG_HANDLE(WEASEL_IPC_UPDATE_LOCAL_CONTEXT, OnUpdateLocalContext)
+   PIPE_MSG_HANDLE(WEASEL_IPC_UPDATE_INPUT_POS, OnUpdateInputPosition)
+   PIPE_MSG_HANDLE(WEASEL_IPC_START_MAINTENANCE, OnStartMaintenance)
+   PIPE_MSG_HANDLE(WEASEL_IPC_END_MAINTENANCE, OnEndMaintenance)
+@@ -426,11 +460,15 @@ PipeServer::ServerRunner PipeServer::GetServerRunner(
+ }
+ 
+ void PipeServer::_ProcessPipeThread(HANDLE pipe, ServerHandler const& handler) {
++  // Each connection owns its input/output buffers. Receiving the next client's
++  // message must never overwrite a context while another handler is using it.
++  PipeServer connection(std::wstring(pname), nullptr);
+   try {
+     for (;;) {
+       Res msg;
+-      _Receive(pipe, &msg, sizeof(msg));
+-      handler(msg, [this, pipe](Msg resp) { _Send(pipe, resp); });
++      connection._Receive(pipe, &msg, sizeof(msg));
++      handler(msg, connection,
++              [&connection, pipe](Msg resp) { connection._Send(pipe, resp); });
+     }
+   } catch (...) {
+     _FinalizePipe(pipe);
+diff --git a/WeaselIPCServer/WeaselServerImpl.h b/WeaselIPCServer/WeaselServerImpl.h
+index a4d123d..7d4cd95 100644
+--- a/WeaselIPCServer/WeaselServerImpl.h
++++ b/WeaselIPCServer/WeaselServerImpl.h
+@@ -54,6 +54,7 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+   DWORD OnShutdownServer(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+   DWORD OnFocusIn(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+   DWORD OnFocusOut(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
++  DWORD OnUpdateLocalContext(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+   DWORD OnUpdateInputPosition(WEASEL_IPC_COMMAND uMsg,
+                               DWORD wParam,
+                               DWORD lParam);
+@@ -92,6 +93,8 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+   void HandlePipeMessage(PipeMessage pipe_msg, _Resp resp);
+ 
+   std::unique_ptr<PipeServer> channel;
++  // Valid only while the serialized synchronous request handler is running.
++  PipeServer* request_channel = nullptr;
+   std::unique_ptr<boost::thread> pipeThread;
+   RequestHandler* m_pRequestHandler;  // reference
+   std::map<UINT, CommandHandler> m_MenuHandlers;
+diff --git a/WeaselTSF/Composition.cpp b/WeaselTSF/Composition.cpp
+index e94cea0..956f76e 100644
+--- a/WeaselTSF/Composition.cpp
++++ b/WeaselTSF/Composition.cpp
+@@ -25,6 +25,8 @@ class CStartCompositionEditSession : public CEditSession {
+ };
+ 
+ STDAPI CStartCompositionEditSession::DoEditSession(TfEditCookie ec) {
++  if (!_IsCurrentDocument())
++    return S_OK;
+   HRESULT hr = E_FAIL;
+   com_ptr<ITfInsertAtSelection> pInsertAtSelection;
+   com_ptr<ITfRange> pRangeComposition;
+@@ -92,6 +94,11 @@ class CEndCompositionEditSession : public CEditSession {
+                              BOOL clear = TRUE)
+       : CEditSession(pTextService, pContext), _clear(clear) {
+     _pComposition = pComposition;
++    _pTextService->_BeginCompositionEnd(_pContext);
++  }
++
++  ~CEndCompositionEditSession() override {
++    _pTextService->_FinishCompositionEnd(_pContext);
+   }
+ 
+   /* ITfEditSession */
+@@ -107,14 +114,16 @@ STDAPI CEndCompositionEditSession::DoEditSession(TfEditCookie ec) {
+   if (_pComposition == nullptr)
+     return S_OK;
+ 
+-  _pTextService->_ClearCompositionDisplayAttributes(ec, _pContext);
++  _pTextService->_ClearCompositionDisplayAttributes(ec, _pContext, _pComposition);
+ 
+-  ITfRange* pCompositionRange;
++  com_ptr<ITfRange> pCompositionRange;
+   if (_clear && _pComposition->GetRange(&pCompositionRange) == S_OK)
+     pCompositionRange->SetText(ec, 0, L"", 0);
+ 
++  // An old cleanup may run after a new composition was created. Clear only
++  // the captured composition, before a synchronous termination notification.
++  _pTextService->_FinalizeComposition(_pComposition);
+   _pComposition->EndComposition(ec);
+-  _pTextService->_FinalizeComposition();
+   return S_OK;
+ }
+ 
+@@ -125,6 +134,9 @@ void WeaselTSF::_EndComposition(com_ptr<ITfContext> pContext, BOOL clear) {
+   _cand->EndUI();
+   if ((pEditSession = new CEndCompositionEditSession(
+            this, pContext, _pComposition, clear)) != NULL) {
++    // Detach now: another focused context can start composing before this
++    // asynchronous cleanup runs. Its ranges and attributes are captured above.
++    _FinalizeComposition(_pComposition);
+     pContext->RequestEditSession(_tfClientId, pEditSession,
+                                  TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
+     pEditSession->Release();
+@@ -155,6 +167,8 @@ class CGetTextExtentEditSession : public CEditSession {
+ };
+ 
+ STDAPI CGetTextExtentEditSession::DoEditSession(TfEditCookie ec) {
++  if (!_IsCurrentDocument())
++    return S_OK;
+   com_ptr<ITfInsertAtSelection> pInsertAtSelection;
+   com_ptr<ITfRange> pRangeComposition;
+   ITfRange* pRange;
+@@ -262,6 +276,8 @@ class CInlinePreeditEditSession : public CEditSession {
+ };
+ 
+ STDAPI CInlinePreeditEditSession::DoEditSession(TfEditCookie ec) {
++  if (!_IsCurrentDocument())
++    return S_OK;
+   std::wstring preedit = _context->preedit.str;
+ 
+   com_ptr<ITfRange> pRangeComposition;
+@@ -337,6 +353,8 @@ class CInsertTextEditSession : public CEditSession {
+ };
+ 
+ STDMETHODIMP CInsertTextEditSession::DoEditSession(TfEditCookie ec) {
++  if (!_IsCurrentDocument())
++    return S_OK;
+   com_ptr<ITfRange> pRange;
+   TF_SELECTION tfSelection;
+   HRESULT hRet = S_OK;
+@@ -377,13 +395,24 @@ BOOL WeaselTSF::_InsertText(com_ptr<ITfContext> pContext,
+   return TRUE;
+ }
+ 
++class CResponseEditSession : public CEditSession {
++ public:
++  CResponseEditSession(WeaselTSF* service, ITfContext* context)
++      : CEditSession(service, context) {}
++  STDMETHODIMP DoEditSession(TfEditCookie ec) override {
++    return _IsCurrentDocument() ? _pTextService->DoEditSession(ec) : S_OK;
++  }
++};
++
+ void WeaselTSF::_UpdateComposition(com_ptr<ITfContext> pContext) {
+   HRESULT hr;
+ 
+   _pEditSessionContext = pContext;
++  com_ptr<CResponseEditSession> session;
++  session.Attach(new CResponseEditSession(this, pContext));
+ 
+   _pEditSessionContext->RequestEditSession(
+-      _tfClientId, this, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
++      _tfClientId, session, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
+   _async_edit = !!(hr == TF_S_ASYNC);
+   _UpdateCompositionWindow(pContext);
+ }
+@@ -395,21 +424,38 @@ STDAPI WeaselTSF::OnCompositionTerminated(TfEditCookie ecWrite,
+   // This will be called when an edit session ended up with an empty composition
+   // string, Even if it is closed normally. Silly M$.
+ 
+-  _AbortComposition();
++  if (_IsCurrentComposition(pComposition)) {
++    _InvalidateLocalContext(true);
++    _AbortComposition();
++  }
+   return S_OK;
+ }
+ 
+ void WeaselTSF::_AbortComposition(bool clear) {
++  _InvalidateLocalContext(true);
+   m_client.ClearComposition();
+   if (_IsComposing()) {
+-    _EndComposition(_pEditSessionContext, clear);
++    // The last key's context may already belong to a newly focused control.
++    // Obtain the write session from the captured composition's actual owner.
++    com_ptr<ITfRange> range;
++    com_ptr<ITfContext> owner;
++    if (_pComposition->GetRange(&range) == S_OK && range &&
++        range->GetContext(&owner) == S_OK && owner)
++      _EndComposition(owner, clear);
++    else
++      _FinalizeComposition(_pComposition);
+   }
+   _committed = TRUE;
+   _cand->Destroy();
+ }
+ 
+-void WeaselTSF::_FinalizeComposition() {
+-  _pComposition = nullptr;
++void WeaselTSF::_FinalizeComposition(ITfComposition* expected) {
++  if (_IsCurrentComposition(expected))
++    _pComposition = nullptr;
++}
++
++bool WeaselTSF::_IsCurrentComposition(ITfComposition* composition) const {
++  return _pComposition && _pComposition.p == composition;
+ }
+ 
+ void WeaselTSF::_SetComposition(com_ptr<ITfComposition> pComposition) {
+diff --git a/WeaselTSF/DisplayAttribute.cpp b/WeaselTSF/DisplayAttribute.cpp
+index 679c799..d875f30 100644
+--- a/WeaselTSF/DisplayAttribute.cpp
++++ b/WeaselTSF/DisplayAttribute.cpp
+@@ -3,11 +3,12 @@
+ #include "WeaselTSF.h"
+ 
+ void WeaselTSF::_ClearCompositionDisplayAttributes(TfEditCookie ec,
+-                                                   _In_ ITfContext* pContext) {
++                                                   _In_ ITfContext* pContext,
++                                                   ITfComposition* composition) {
+   ITfRange* pRangeComposition = nullptr;
+   ITfProperty* pDisplayAttributeProperty = nullptr;
+ 
+-  if (FAILED(_pComposition->GetRange(&pRangeComposition))) {
++  if (!composition || FAILED(composition->GetRange(&pRangeComposition))) {
+     return;
+   }
+ 
+diff --git a/WeaselTSF/EditSession.h b/WeaselTSF/EditSession.h
+index 7071885..150a021 100644
+--- a/WeaselTSF/EditSession.h
++++ b/WeaselTSF/EditSession.h
+@@ -6,7 +6,8 @@
+ class CEditSession : public ITfEditSession {
+  public:
+   CEditSession(com_ptr<WeaselTSF> pTextService, com_ptr<ITfContext> pContext)
+-      : _pTextService(pTextService), _pContext(pContext) {
++      : _pTextService(pTextService), _pContext(pContext),
++        _documentEpoch(pTextService->_DocumentEpoch()) {
+     _cRef = 1;
+   }
+ 
+@@ -43,9 +44,13 @@ class CEditSession : public ITfEditSession {
+   virtual STDMETHODIMP DoEditSession(TfEditCookie ec) = 0;
+ 
+  protected:
++  bool _IsCurrentDocument() const {
++    return _pTextService->_IsCurrentDocument(_pContext, _documentEpoch);
++  }
+   com_ptr<WeaselTSF> _pTextService;
+   com_ptr<ITfContext> _pContext;
++  const ULONGLONG _documentEpoch;
+ 
+  private:
+   LONG _cRef; /* COM reference count */
+-};
+\ No newline at end of file
++};
+diff --git a/WeaselTSF/KeyEventSink.cpp b/WeaselTSF/KeyEventSink.cpp
+index c885ddd..6facb63 100644
+--- a/WeaselTSF/KeyEventSink.cpp
++++ b/WeaselTSF/KeyEventSink.cpp
+@@ -8,19 +8,23 @@ static weasel::KeyEvent prevKeyEvent;
+ static BOOL prevfEaten = FALSE;
+ static int keyCountToSimulate = 0;
+ 
+-void WeaselTSF::_ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
++void WeaselTSF::_ProcessKeyEvent(ITfContext* pContext, WPARAM wParam,
++                               LPARAM lParam, BOOL* pfEaten) {
+   // when _IsKeyboardDisabled don't eat the key,
+   // when keyboard closable and keyboard closed, don't eat the key
+   if ((_isToOpenClose && !_IsKeyboardOpen()) || _IsKeyboardDisabled()) {
++    _InvalidateLocalContext(true);
+     *pfEaten = FALSE;
+     return;
+   }
+ 
+   // if server connection is Not OK, don't eat it.
+   if (!_EnsureServerConnected()) {
++    _InvalidateLocalContext();
+     *pfEaten = FALSE;
+     return;
+   }
++  _RefreshLocalContext(pContext);
+   weasel::KeyEvent ke;
+   GetKeyboardState(_lpbKeyState);
+   if (!ConvertKeyEvent(static_cast<UINT>(wParam), lParam, _lpbKeyState, ke)) {
+@@ -63,6 +67,9 @@ void WeaselTSF::_ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
+ }
+ 
+ STDAPI WeaselTSF::OnSetFocus(BOOL fForeground) {
++  _localContextSuspended = !fForeground;
++  _InvalidateLocalContext(true);
++  _fTestKeyDownPending = _fTestKeyUpPending = FALSE;
+   if (fForeground)
+     m_client.FocusIn();
+   else {
+@@ -92,7 +99,7 @@ STDAPI WeaselTSF::OnTestKeyDown(ITfContext* pContext,
+     *pfEaten = TRUE;
+     return S_OK;
+   }
+-  _ProcessKeyEvent(wParam, lParam, pfEaten);
++  _ProcessKeyEvent(pContext, wParam, lParam, pfEaten);
+   _UpdateComposition(pContext);
+   if (*pfEaten)
+     _fTestKeyDownPending = TRUE;
+@@ -108,7 +115,7 @@ STDAPI WeaselTSF::OnKeyDown(ITfContext* pContext,
+     _fTestKeyDownPending = FALSE;
+     *pfEaten = TRUE;
+   } else {
+-    _ProcessKeyEvent(wParam, lParam, pfEaten);
++    _ProcessKeyEvent(pContext, wParam, lParam, pfEaten);
+     _UpdateComposition(pContext);
+   }
+   return S_OK;
+@@ -123,7 +130,7 @@ STDAPI WeaselTSF::OnTestKeyUp(ITfContext* pContext,
+     *pfEaten = TRUE;
+     return S_OK;
+   }
+-  _ProcessKeyEvent(wParam, lParam, pfEaten);
++  _ProcessKeyEvent(pContext, wParam, lParam, pfEaten);
+   _UpdateComposition(pContext);
+   if (*pfEaten)
+     _fTestKeyUpPending = TRUE;
+@@ -139,7 +146,7 @@ STDAPI WeaselTSF::OnKeyUp(ITfContext* pContext,
+     _fTestKeyUpPending = FALSE;
+     *pfEaten = TRUE;
+   } else {
+-    _ProcessKeyEvent(wParam, lParam, pfEaten);
++    _ProcessKeyEvent(pContext, wParam, lParam, pfEaten);
+     if (!_async_edit)
+       _UpdateComposition(pContext);
+   }
+diff --git a/WeaselTSF/LocalContext.cpp b/WeaselTSF/LocalContext.cpp
+new file mode 100644
+index 0000000..c63dcbb
+--- /dev/null
++++ b/WeaselTSF/LocalContext.cpp
+@@ -0,0 +1,177 @@
++#include "stdafx.h"
++#include "EditSession.h"
++#include "LocalContext.h"
++#include <SmartIMContext.h>
++#include <inputscope.h>
++
++namespace {
++
++// Input scope is optional (VT_EMPTY). Malformed/failed scope reads cannot
++// authorize collecting text. Disabled/secure contexts are rejected earlier.
++bool AllowsContext(ITfContext* context, TfEditCookie ec, ITfRange* selection) {
++  CComPtr<ITfReadOnlyProperty> property;
++  if (FAILED(context->GetAppProperty(GUID_PROP_INPUTSCOPE, &property)) || !property)
++    return false;
++  CComVariant value;
++  if (FAILED(property->GetValue(ec, selection, &value)))
++    return false;
++  if (value.vt == VT_EMPTY)
++    return true;
++  if (value.vt != VT_UNKNOWN || !value.punkVal)
++    return false;
++  CComPtr<ITfInputScope> scope;
++  if (FAILED(value.punkVal->QueryInterface(IID_PPV_ARGS(&scope))))
++    return false;
++  InputScope* scopes = nullptr;
++  UINT count = 0;
++  if (FAILED(scope->GetInputScopes(&scopes, &count))) {
++    CoTaskMemFree(scopes);
++    return false;
++  }
++  bool allowed = count == 0 || scopes != nullptr;
++  for (UINT i = 0; allowed && i < count; ++i) {
++    switch (scopes[i]) {
++      case IS_PASSWORD:
++      case IS_PRIVATE:
++      case IS_NUMERIC_PASSWORD:
++      case IS_NUMERIC_PIN:
++      case IS_ALPHANUMERIC_PIN:
++      case IS_ALPHANUMERIC_PIN_SET:
++        allowed = false;
++        break;
++      default:
++        break;
++    }
++  }
++  CoTaskMemFree(scopes);
++  return allowed;
++}
++
++class CReadLocalContextSession : public CEditSession {
++ public:
++  CReadLocalContextSession(WeaselTSF* service, ITfContext* context)
++      : CEditSession(service, context) {}
++
++  STDMETHODIMP DoEditSession(TfEditCookie ec) override {
++    return _pTextService->_ReadLocalContext(_pContext, ec) ? S_OK : E_FAIL;
++  }
++};
++
++}  // namespace
++
++void WeaselTSF::_InvalidateLocalContext(bool documentChanged) {
++  if (documentChanged)
++    ++_documentEpoch;
++  ++_localContextGeneration;
++  _localContext.Release();
++  _localSelection.Release();
++  _localBefore.clear();
++  _localAfter.clear();
++  if (!_localContextPacket.empty()) {
++    _localContextPacket.clear();
++    _localPublishedPacket.clear();
++    m_client.UpdateLocalContext(L"");
++    _HideUI();
++  }
++}
++
++bool WeaselTSF::_ReadLocalContext(ITfContext* context,
++                                  TfEditCookie ec,
++                                  bool compareSelection) {
++  if (!context || !_pThreadMgr || _localContextSuspended ||
++      _pendingCompositionEnds.count(context) != 0 ||
++      _status.schema_id != L"smart_im" || _status.disabled ||
++      (_activateFlags & TF_TMF_SECUREMODE) || _IsKeyboardDisabled())
++    return false;
++  CComPtr<ITfDocumentMgr> focused;
++  CComPtr<ITfContext> top;
++  TF_STATUS status{};
++  if (_pThreadMgr->GetFocus(&focused) != S_OK || !focused ||
++      focused->GetTop(&top) != S_OK || top.p != context ||
++      context->GetStatus(&status) != S_OK ||
++      (status.dwStaticFlags & TS_SS_TRANSITORY))
++    return false;
++
++  TF_SELECTION selection{};
++  ULONG fetched = 0;
++  if (context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched) != S_OK ||
++      fetched != 1 || !selection.range)
++    return false;
++  CComPtr<ITfRange> selectionRange;
++  selectionRange.Attach(selection.range);
++  if (!AllowsContext(context, ec, selectionRange))
++    return false;
++
++  CComPtr<ITfRange> replacement = selectionRange;
++  if (_pComposition) {
++    CComPtr<ITfRange> composition;
++    CComPtr<ITfContext> owner;
++    if (_pComposition->GetRange(&composition) != S_OK || !composition ||
++        composition->GetContext(&owner) != S_OK || owner.p != context ||
++        !smart_im::Covers(ec, composition, selectionRange))
++      return false;
++    replacement = composition;
++  }
++  std::wstring before, after, beforeHex, afterHex;
++  if (!smart_im::ReadSide(ec, replacement, true, before) ||
++      !smart_im::ReadSide(ec, replacement, false, after) ||
++      !smart_im::Utf8Hex(before, beforeHex) ||
++      !smart_im::Utf8Hex(after, afterHex))
++    return false;
++
++  const bool moved = compareSelection && _localSelection &&
++      !smart_im::SameRange(ec, _localSelection, selectionRange);
++  if (_localContext.p != context || moved || _localBefore != before || _localAfter != after)
++    _InvalidateLocalContext(moved || (_localContext && _localContext.p != context));
++  _localContext = context;
++  _localSelection.Release();
++  if (selectionRange->Clone(&_localSelection) != S_OK)
++    return false;
++  _localBefore = before;
++  _localAfter = after;
++  const std::wstring token = std::to_wstring(GetCurrentProcessId()) + L"_" +
++      std::to_wstring(GetCurrentThreadId()) + L"_" +
++      std::to_wstring(reinterpret_cast<ULONG_PTR>(this)) + L"_" +
++      std::to_wstring(_localContextGeneration);
++  _localContextPacket = L"1\t" + token + L"\t" + beforeHex + L"\t" + afterHex;
++  return smart_im::ValidPacket(_localContextPacket);
++}
++
++void WeaselTSF::_PublishLocalContext(bool force) {
++  if (!_localContextPacket.empty() &&
++      (force || _localContextPacket != _localPublishedPacket)) {
++    if (m_client.UpdateLocalContext(_localContextPacket))
++      _localPublishedPacket = _localContextPacket;
++    else
++      _InvalidateLocalContext();
++  }
++}
++
++void WeaselTSF::_RefreshLocalContext(ITfContext* context) {
++  // Called in keystroke handling before Rime processes that key. A denied
++  // synchronous read fails closed; an asynchronous snapshot would be too late.
++  if (!context) {
++    _InvalidateLocalContext();
++    return;
++  }
++  CComPtr<CReadLocalContextSession> session;
++  session.Attach(new CReadLocalContextSession(this, context));
++  HRESULT result = E_FAIL;
++  const HRESULT hr = context->RequestEditSession(_tfClientId, session,
++                                                TF_ES_SYNC | TF_ES_READ, &result);
++  if (FAILED(hr) || result != S_OK)
++    _InvalidateLocalContext();
++  else
++    // A server reconnect or schema switch may have replaced the Rime context.
++    // The server deduplicates equal properties without notifying Lua again.
++    _PublishLocalContext(true);
++}
++
++bool WeaselTSF::_IsCurrentDocument(ITfContext* context, ULONGLONG epoch) const {
++  if (!_pThreadMgr || _localContextSuspended || epoch != _documentEpoch)
++    return false;
++  CComPtr<ITfDocumentMgr> document;
++  CComPtr<ITfContext> top;
++  return _pThreadMgr->GetFocus(&document) == S_OK && document &&
++      document->GetTop(&top) == S_OK && top.p == context;
++}
+diff --git a/WeaselTSF/LocalContext.h b/WeaselTSF/LocalContext.h
+new file mode 100644
+index 0000000..6701900
+--- /dev/null
++++ b/WeaselTSF/LocalContext.h
+@@ -0,0 +1,80 @@
++#pragma once
++
++#include <string>
++#include <windows.h>
++#include <msctf.h>
++#include <atlcomcli.h>
++
++namespace smart_im {
++
++// Limits are UTF-16 code units at the TSF boundary. Neither side reads the
++// complete document, crosses a region, or includes the replacement range.
++constexpr ULONG kContextUnits = 128;
++
++inline bool Covers(TfEditCookie ec, ITfRange* cover, ITfRange* selection) {
++  LONG start = 0, end = 0;
++  return cover->CompareStart(ec, selection, TF_ANCHOR_START, &start) == S_OK &&
++         cover->CompareEnd(ec, selection, TF_ANCHOR_END, &end) == S_OK &&
++         start <= 0 && end >= 0;
++}
++
++inline bool SameRange(TfEditCookie ec, ITfRange* left, ITfRange* right) {
++  LONG start = 0, end = 0;
++  return left && right &&
++         left->CompareStart(ec, right, TF_ANCHOR_START, &start) == S_OK &&
++         left->CompareEnd(ec, right, TF_ANCHOR_END, &end) == S_OK &&
++         start == 0 && end == 0;
++}
++
++inline bool ReadSide(TfEditCookie ec,
++                     ITfRange* replacement,
++                     bool before,
++                     std::wstring& text) {
++  CComPtr<ITfRange> range;
++  if (replacement->Clone(&range) != S_OK || !range ||
++      range->Collapse(ec, before ? TF_ANCHOR_START : TF_ANCHOR_END) != S_OK)
++    return false;
++  LONG moved = 0;
++  const HRESULT hr = before
++      ? range->ShiftStart(ec, -static_cast<LONG>(kContextUnits), &moved, nullptr)
++      : range->ShiftEnd(ec, static_cast<LONG>(kContextUnits), &moved, nullptr);
++  if (FAILED(hr))
++    return false;
++  const LONG expected = before ? -moved : moved;
++  if (expected < 0 || expected > static_cast<LONG>(kContextUnits))
++    return false;
++  WCHAR buffer[kContextUnits];
++  ULONG count = 0;
++  // Do not use TF_TF_IGNOREEND: it would include composition/selected text.
++  if (range->GetText(ec, 0, buffer, kContextUnits, &count) != S_OK ||
++      count != static_cast<ULONG>(expected))
++    return false;
++  text.assign(buffer, count);
++  // A bounded read may cut a surrogate pair at its outer edge.
++  if (before && !text.empty() && text.front() >= 0xdc00 && text.front() <= 0xdfff)
++    text.erase(0, 1);
++  if (!before && !text.empty() && text.back() >= 0xd800 && text.back() <= 0xdbff)
++    text.pop_back();
++  return text.find(L'\0') == std::wstring::npos;
++}
++
++inline bool Utf8Hex(const std::wstring& text, std::wstring& result) {
++  result.clear();
++  if (text.empty())
++    return true;
++  char buffer[kContextUnits * 3];
++  const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
++      text.data(), static_cast<int>(text.size()), buffer, sizeof(buffer),
++      nullptr, nullptr);
++  if (!length)
++    return false;
++  static const WCHAR digits[] = L"0123456789abcdef";
++  for (int i = 0; i < length; ++i) {
++    const auto byte = static_cast<unsigned char>(buffer[i]);
++    result.push_back(digits[byte >> 4]);
++    result.push_back(digits[byte & 15]);
++  }
++  return true;
++}
++
++}  // namespace smart_im
+diff --git a/WeaselTSF/TextEditSink.cpp b/WeaselTSF/TextEditSink.cpp
+index a6bc1f0..ffd1da9 100644
+--- a/WeaselTSF/TextEditSink.cpp
++++ b/WeaselTSF/TextEditSink.cpp
+@@ -1,58 +1,43 @@
+ #include "stdafx.h"
+ #include "WeaselTSF.h"
+-
+-static BOOL IsRangeCovered(TfEditCookie ec,
+-                           ITfRange* pRangeTest,
+-                           ITfRange* pRangeCover) {
+-  LONG lResult;
+-
+-  if (pRangeCover->CompareStart(ec, pRangeTest, TF_ANCHOR_START, &lResult) !=
+-          S_OK ||
+-      lResult > 0)
+-    return FALSE;
+-  if (pRangeCover->CompareEnd(ec, pRangeTest, TF_ANCHOR_END, &lResult) !=
+-          S_OK ||
+-      lResult < 0)
+-    return FALSE;
+-  return TRUE;
+-}
++#include <inputscope.h>
+ 
+ STDAPI WeaselTSF::OnEndEdit(ITfContext* pContext,
+                             TfEditCookie ecReadOnly,
+                             ITfEditRecord* pEditRecord) {
+-  BOOL fSelectionChanged;
+-  IEnumTfRanges* pEnumTextChanges;
+-  ITfRange* pRange;
+-
+-  /* did the selection change? */
+-  if (pEditRecord->GetSelectionStatus(&fSelectionChanged) == S_OK &&
+-      fSelectionChanged) {
+-    if (_IsComposing()) {
+-      /* if the caret moves out of composition range, stop the composition */
+-      TF_SELECTION tfSelection;
+-      ULONG cFetched;
+-
+-      if (pContext->GetSelection(ecReadOnly, TF_DEFAULT_SELECTION, 1,
+-                                 &tfSelection, &cFetched) == S_OK &&
+-          cFetched == 1) {
+-        ITfRange* pRangeComposition;
+-        if (_pComposition->GetRange(&pRangeComposition) == S_OK) {
+-          if (!IsRangeCovered(ecReadOnly, tfSelection.range, pRangeComposition))
+-            _EndComposition(pContext, true);
+-          pRangeComposition->Release();
+-        }
+-      }
+-    }
++  if (pContext != _pTextEditSinkContext)
++    return S_OK;
++  BOOL fSelectionChanged = FALSE;
++  BOOL ownWrite = FALSE;
++  const bool knownWriter = pContext->InWriteSession(_tfClientId, &ownWrite) == S_OK;
++  const bool knownSelection =
++      pEditRecord->GetSelectionStatus(&fSelectionChanged) == S_OK;
++  com_ptr<IEnumTfRanges> changes;
++  com_ptr<ITfRange> changedRange;
++  const GUID* properties[] = {&GUID_PROP_INPUTSCOPE};
++  const bool knownChanges = pEditRecord->GetTextAndPropertyUpdates(
++      TF_GTP_INCL_TEXT, properties, 1, &changes) == S_OK;
++  const bool textChanged = knownChanges && changes &&
++      changes->Next(1, &changedRange, nullptr) == S_OK;
++  // The documented InWriteSession check survives DoEditSession returning;
++  // a stack-local "writing" guard would already have been destroyed here.
++  // External selection changes invalidate even when nearby text is identical.
++  if (!knownSelection || !knownChanges || !knownWriter ||
++      (!ownWrite && (fSelectionChanged || textChanged))) {
++    // A mouse move inside preedit does not update Rime's segmentation/caret.
++    // Abort that composition instead of reusing its old selected segments.
++    // Clear Rime even when its asynchronous TSF start has not executed yet.
++    // The next keystroke captures the new insertion point before processing.
++    _AbortComposition();
++    return S_OK;
+   }
+ 
+-  /* text modification? */
+-  if (pEditRecord->GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, NULL, 0,
+-                                             &pEnumTextChanges) == S_OK) {
+-    if (pEnumTextChanges->Next(1, &pRange, NULL) == S_OK) {
+-      pRange->Release();
+-    }
+-    pEnumTextChanges->Release();
+-  }
++  // Own inline-preedit text/caret changes leave the excluded surrounding
++  // document unchanged. Refresh anchors without rotating their token.
++  if (_ReadLocalContext(pContext, ecReadOnly, !ownWrite))
++    _PublishLocalContext();
++  else
++    _InvalidateLocalContext();
+   return S_OK;
+ }
+ 
+@@ -74,6 +59,9 @@ BOOL WeaselTSF::_InitTextEditSink(com_ptr<ITfDocumentMgr> pDocMgr) {
+   com_ptr<ITfSource> pSource;
+   BOOL fRet;
+ 
++  _InvalidateLocalContext(true);
++  _fTestKeyDownPending = _fTestKeyUpPending = FALSE;
++
+   /* clear out any previous sink first */
+   if (_dwTextEditSinkCookie != TF_INVALID_COOKIE) {
+     _pTextEditSinkContext->QueryInterface(&pSource);
+diff --git a/WeaselTSF/ThreadMgrEventSink.cpp b/WeaselTSF/ThreadMgrEventSink.cpp
+index a46ca37..87a179f 100644
+--- a/WeaselTSF/ThreadMgrEventSink.cpp
++++ b/WeaselTSF/ThreadMgrEventSink.cpp
+@@ -6,32 +6,48 @@ STDAPI WeaselTSF::OnInitDocumentMgr(ITfDocumentMgr* pDocMgr) {
+ }
+ 
+ STDAPI WeaselTSF::OnUninitDocumentMgr(ITfDocumentMgr* pDocMgr) {
++  com_ptr<ITfDocumentMgr> owner;
++  if (_pTextEditSinkContext &&
++      _pTextEditSinkContext->GetDocumentMgr(&owner) == S_OK && owner == pDocMgr) {
++    _AbortComposition();
++    _InitTextEditSink(nullptr);
++  }
+   return S_OK;
+ }
+ 
+ STDAPI WeaselTSF::OnSetFocus(ITfDocumentMgr* pDocMgrFocus,
+                              ITfDocumentMgr* pDocMgrPrevFocus) {
++  _InvalidateLocalContext(true);
++  if (pDocMgrFocus != pDocMgrPrevFocus)
++    _AbortComposition();
+   _InitTextEditSink(pDocMgrFocus);
+ 
+-  com_ptr<ITfDocumentMgr> pCandidateListDocumentMgr;
+-  com_ptr<ITfContext> pTfContext = _GetUIContextDocument();
+-  if ((nullptr != pTfContext) &&
+-      SUCCEEDED(pTfContext->GetDocumentMgr(&pCandidateListDocumentMgr))) {
+-    if (pCandidateListDocumentMgr != pDocMgrFocus) {
+-      _HideUI();
+-    } else {
+-      _ShowUI();
+-    }
+-  }
++  // Focus restoration must not resurrect the previous candidate window.
++  _HideUI();
+ 
+   return S_OK;
+ }
+ 
+ STDAPI WeaselTSF::OnPushContext(ITfContext* pContext) {
++  com_ptr<ITfDocumentMgr> owner, focused;
++  if (_pThreadMgr && pContext &&
++      pContext->GetDocumentMgr(&owner) == S_OK &&
++      _pThreadMgr->GetFocus(&focused) == S_OK && owner == focused) {
++    _AbortComposition();
++    _InitTextEditSink(focused);
++  }
+   return S_OK;
+ }
+ 
+ STDAPI WeaselTSF::OnPopContext(ITfContext* pContext) {
++  if (pContext == _pTextEditSinkContext) {
++    com_ptr<ITfDocumentMgr> focused;
++    _InvalidateLocalContext(true);
++    _AbortComposition();
++    if (_pThreadMgr)
++      _pThreadMgr->GetFocus(&focused);
++    _InitTextEditSink(focused);
++  }
+   return S_OK;
+ }
+ 
+diff --git a/WeaselTSF/WeaselTSF.cpp b/WeaselTSF/WeaselTSF.cpp
+index 590d3b8..3cee771 100644
+--- a/WeaselTSF/WeaselTSF.cpp
++++ b/WeaselTSF/WeaselTSF.cpp
+@@ -95,6 +95,8 @@ STDAPI WeaselTSF::Activate(ITfThreadMgr* pThreadMgr, TfClientId tfClientId) {
+ }
+ 
+ STDAPI WeaselTSF::Deactivate() {
++  _localContextSuspended = true;
++  _InvalidateLocalContext(true);
+   m_client.EndSession();
+ 
+   _InitTextEditSink(com_ptr<ITfDocumentMgr>());
+@@ -124,6 +126,7 @@ STDAPI WeaselTSF::ActivateEx(ITfThreadMgr* pThreadMgr,
+                              DWORD dwFlags) {
+   com_ptr<ITfDocumentMgr> pDocMgrFocus;
+   _activateFlags = dwFlags;
++  _localContextSuspended = false;
+ 
+   _pThreadMgr = pThreadMgr;
+   _tfClientId = tfClientId;
+@@ -169,6 +172,8 @@ ExitError:
+ }
+ 
+ STDMETHODIMP WeaselTSF::OnSetThreadFocus() {
++  _localContextSuspended = false;
++  _InvalidateLocalContext(true);
+   std::wstring _ToggleImeOnOpenClose{};
+   RegGetStringValue(HKEY_CURRENT_USER, L"Software\\Rime\\weasel",
+                     L"ToggleImeOnOpenClose", _ToggleImeOnOpenClose);
+@@ -183,6 +188,8 @@ STDMETHODIMP WeaselTSF::OnSetThreadFocus() {
+   return S_OK;
+ }
+ STDMETHODIMP WeaselTSF::OnKillThreadFocus() {
++  _localContextSuspended = true;
++  _InvalidateLocalContext(true);
+   _AbortComposition();
+   return S_OK;
+ }
+diff --git a/WeaselTSF/WeaselTSF.h b/WeaselTSF/WeaselTSF.h
+index 696d3cc..038de88 100644
+--- a/WeaselTSF/WeaselTSF.h
++++ b/WeaselTSF/WeaselTSF.h
+@@ -120,7 +120,7 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   void _SetComposition(com_ptr<ITfComposition> pComposition);
+   void _SetCompositionPosition(const RECT& rc);
+   BOOL _UpdateCompositionWindow(com_ptr<ITfContext> pContext);
+-  void _FinalizeComposition();
++  void _FinalizeComposition(ITfComposition* expected);
+   void _AbortComposition(bool clear = true);
+ 
+   /* Language bar */
+@@ -130,6 +130,24 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   /* IPC */
+   bool _EnsureServerConnected();
+ 
++  // TSF document context is separate from Rime's preedit/selected segments.
++  bool _ReadLocalContext(ITfContext* context, TfEditCookie ec,
++                        bool compareSelection = true);
++  void _RefreshLocalContext(ITfContext* context);
++  void _InvalidateLocalContext(bool documentChanged = false);
++  void _PublishLocalContext(bool force = false);
++  ULONGLONG _DocumentEpoch() const { return _documentEpoch; }
++  bool _IsCurrentDocument(ITfContext* context, ULONGLONG epoch) const;
++  bool _IsCurrentComposition(ITfComposition* composition) const;
++  void _BeginCompositionEnd(ITfContext* context) {
++    ++_pendingCompositionEnds[context];
++  }
++  void _FinishCompositionEnd(ITfContext* context) {
++    const auto found = _pendingCompositionEnds.find(context);
++    if (found != _pendingCompositionEnds.end() && --found->second == 0)
++      _pendingCompositionEnds.erase(found);
++  }
++
+   /* UI */
+   void _UpdateUI(const weasel::Context& ctx, const weasel::Status& status);
+   void _StartUI();
+@@ -140,7 +158,8 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+ 
+   /* Display Attribute */
+   void _ClearCompositionDisplayAttributes(TfEditCookie ec,
+-                                          _In_ ITfContext* pContext);
++                                          _In_ ITfContext* pContext,
++                                          ITfComposition* composition);
+   BOOL _SetCompositionDisplayAttributes(TfEditCookie ec,
+                                         _In_ ITfContext* pContext,
+                                         ITfRange* pRangeComposition);
+@@ -169,7 +188,8 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+ 
+   BOOL _InitKeyEventSink();
+   void _UninitKeyEventSink();
+-  void _ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten);
++  void _ProcessKeyEvent(ITfContext* pContext, WPARAM wParam, LPARAM lParam,
++                       BOOL* pfEaten);
+ 
+   BOOL _InitPreservedKey();
+   void _UninitPreservedKey();
+@@ -233,4 +253,14 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   BOOL _async_edit = false;
+   BOOL _committed = false;
+   BOOL _isToOpenClose = false;
++
++  ULONGLONG _localContextGeneration = 0;
++  ULONGLONG _documentEpoch = 0;
++  // End sessions own the corresponding context references until removal.
++  std::map<ITfContext*, unsigned> _pendingCompositionEnds;
++  bool _localContextSuspended = false;
++  com_ptr<ITfContext> _localContext;
++  com_ptr<ITfRange> _localSelection;
++  std::wstring _localBefore, _localAfter, _localContextPacket;
++  std::wstring _localPublishedPacket;
+ };
+diff --git a/WeaselTSF/WeaselTSF.vcxproj b/WeaselTSF/WeaselTSF.vcxproj
+index 3257ea6..efeb7b4 100644
+--- a/WeaselTSF/WeaselTSF.vcxproj
++++ b/WeaselTSF/WeaselTSF.vcxproj
+@@ -462,6 +462,7 @@
+     <ClCompile Include="KeyEvent.cpp" />
+     <ClCompile Include="KeyEventSink.cpp" />
+     <ClCompile Include="LanguageBar.cpp" />
++    <ClCompile Include="LocalContext.cpp" />
+     <ClCompile Include="Register.cpp" />
+     <ClCompile Include="Server.cpp" />
+     <ClCompile Include="stdafx.cpp">
+@@ -487,6 +488,7 @@
+     <ClInclude Include="EnumDisplayAttributeInfo.h" />
+     <ClInclude Include="Globals.h" />
+     <ClInclude Include="LanguageBar.h" />
++    <ClInclude Include="LocalContext.h" />
+     <ClInclude Include="Register.h" />
+     <ClInclude Include="resource.h" />
+     <ClInclude Include="stdafx.h" />
+diff --git a/WeaselTSF/WeaselTSF.vcxproj.filters b/WeaselTSF/WeaselTSF.vcxproj.filters
+index 14c6cc4..5351796 100644
+--- a/WeaselTSF/WeaselTSF.vcxproj.filters
++++ b/WeaselTSF/WeaselTSF.vcxproj.filters
+@@ -57,6 +57,9 @@
+     <ClCompile Include="LanguageBar.cpp">
+       <Filter>Source Files</Filter>
+     </ClCompile>
++    <ClCompile Include="LocalContext.cpp">
++      <Filter>Source Files</Filter>
++    </ClCompile>
+     <ClCompile Include="CandidateList.cpp">
+       <Filter>Source Files</Filter>
+     </ClCompile>
+@@ -77,6 +80,9 @@
+     <ClInclude Include="stdafx.h">
+       <Filter>Header Files</Filter>
+     </ClInclude>
++    <ClInclude Include="LocalContext.h">
++      <Filter>Header Files</Filter>
++    </ClInclude>
+     <ClInclude Include="targetver.h">
+       <Filter>Header Files</Filter>
+     </ClInclude>
+diff --git a/WeaselTSF/tests/LocalContextTest.cpp b/WeaselTSF/tests/LocalContextTest.cpp
+new file mode 100644
+index 0000000..183346c
+--- /dev/null
++++ b/WeaselTSF/tests/LocalContextTest.cpp
+@@ -0,0 +1,183 @@
++// Standalone Windows SDK/ATL test: cl /std:c++17 /EHsc /utf-8 /DUNICODE
++// /D_UNICODE LocalContextTest.cpp /link ole32.lib oleaut32.lib uuid.lib
++#define NOMINMAX
++#include "../LocalContext.h"
++#include <algorithm>
++#include <cassert>
++#include <iostream>
++#include <memory>
++
++struct Document {
++  std::wstring text;
++  LONG regionStart = 0;
++  LONG regionEnd = 0;
++  bool failRead = false;
++  bool shortRead = false;
++};
++
++// A real COM ITfRange implementation with document/region bounds. Unexpected
++// write and whole-document APIs fail, so these tests exercise the TSF reader.
++class Range final : public ITfRange {
++ public:
++  Range(std::shared_ptr<Document> doc, LONG start, LONG end)
++      : doc_(std::move(doc)), start_(start), end_(end) {}
++  STDMETHODIMP QueryInterface(REFIID iid, void** out) override {
++    *out = nullptr;
++    if (iid != IID_IUnknown && iid != IID_ITfRange)
++      return E_NOINTERFACE;
++    *out = static_cast<ITfRange*>(this);
++    AddRef();
++    return S_OK;
++  }
++  STDMETHODIMP_(ULONG) AddRef() override { return ++refs_; }
++  STDMETHODIMP_(ULONG) Release() override {
++    const auto remaining = --refs_;
++    if (!remaining) delete this;
++    return remaining;
++  }
++  STDMETHODIMP GetText(TfEditCookie ec, DWORD flags, WCHAR* text,
++                       ULONG capacity, ULONG* count) override {
++    assert(ec == 42 && flags == 0 && capacity == smart_im::kContextUnits);
++    if (doc_->failRead) return TF_E_NOLOCK;
++    *count = (std::min)(capacity, static_cast<ULONG>(end_ - start_));
++    if (doc_->shortRead && *count) --*count;
++    std::copy_n(doc_->text.data() + start_, *count, text);
++    return S_OK;
++  }
++  STDMETHODIMP ShiftStart(TfEditCookie ec, LONG delta, LONG* moved,
++                          const TF_HALTCOND*) override {
++    assert(ec == 42 && delta == -128);
++    const auto original = start_;
++    start_ = (std::max)(doc_->regionStart, start_ + delta);
++    *moved = start_ - original;
++    return S_OK;
++  }
++  STDMETHODIMP ShiftEnd(TfEditCookie ec, LONG delta, LONG* moved,
++                        const TF_HALTCOND*) override {
++    assert(ec == 42 && delta == 128);
++    const auto original = end_;
++    end_ = (std::min)(doc_->regionEnd, end_ + delta);
++    *moved = end_ - original;
++    return S_OK;
++  }
++  STDMETHODIMP Collapse(TfEditCookie ec, TfAnchor anchor) override {
++    assert(ec == 42);
++    if (anchor == TF_ANCHOR_START) end_ = start_; else start_ = end_;
++    return S_OK;
++  }
++  STDMETHODIMP CompareStart(TfEditCookie, ITfRange* other, TfAnchor anchor,
++                            LONG* result) override {
++    auto range = static_cast<Range*>(other);
++    if (doc_ != range->doc_) return E_INVALIDARG;
++    *result = start_ - (anchor == TF_ANCHOR_START ? range->start_ : range->end_);
++    return S_OK;
++  }
++  STDMETHODIMP CompareEnd(TfEditCookie, ITfRange* other, TfAnchor anchor,
++                          LONG* result) override {
++    auto range = static_cast<Range*>(other);
++    if (doc_ != range->doc_) return E_INVALIDARG;
++    *result = end_ - (anchor == TF_ANCHOR_START ? range->start_ : range->end_);
++    return S_OK;
++  }
++  STDMETHODIMP Clone(ITfRange** out) override {
++    *out = new Range(doc_, start_, end_);
++    return S_OK;
++  }
++#define NOT_USED(name, signature) STDMETHODIMP name signature override { return E_NOTIMPL; }
++  NOT_USED(SetText, (TfEditCookie, DWORD, const WCHAR*, LONG))
++  NOT_USED(GetFormattedText, (TfEditCookie, IDataObject**))
++  NOT_USED(GetEmbedded, (TfEditCookie, REFGUID, REFIID, IUnknown**))
++  NOT_USED(InsertEmbedded, (TfEditCookie, DWORD, IDataObject*))
++  NOT_USED(ShiftStartToRange, (TfEditCookie, ITfRange*, TfAnchor))
++  NOT_USED(ShiftEndToRange, (TfEditCookie, ITfRange*, TfAnchor))
++  NOT_USED(ShiftStartRegion, (TfEditCookie, TfShiftDir, BOOL*))
++  NOT_USED(ShiftEndRegion, (TfEditCookie, TfShiftDir, BOOL*))
++  NOT_USED(IsEmpty, (TfEditCookie, BOOL*))
++  NOT_USED(IsEqualStart, (TfEditCookie, ITfRange*, TfAnchor, BOOL*))
++  NOT_USED(IsEqualEnd, (TfEditCookie, ITfRange*, TfAnchor, BOOL*))
++  NOT_USED(AdjustForInsert, (TfEditCookie, ULONG, BOOL*))
++  NOT_USED(GetGravity, (TfGravity*, TfGravity*))
++  NOT_USED(SetGravity, (TfEditCookie, TfGravity, TfGravity))
++  NOT_USED(GetContext, (ITfContext**))
++#undef NOT_USED
++
++ private:
++  ULONG refs_ = 1;
++  std::shared_ptr<Document> doc_;
++  LONG start_, end_;
++};
++
++static auto DocumentWith(std::wstring text) {
++  auto document = std::make_shared<Document>();
++  document->text = std::move(text);
++  document->regionEnd = static_cast<LONG>(document->text.size());
++  return document;
++}
++
++static CComPtr<ITfRange> At(std::shared_ptr<Document> document, LONG start, LONG end) {
++  CComPtr<ITfRange> range;
++  range.Attach(new Range(std::move(document), start, end));
++  return range;
++}
++
++static void ExpectAround(ITfRange* replacement,
++                         const std::wstring& before,
++                         const std::wstring& after) {
++  std::wstring actualBefore, actualAfter;
++  assert(smart_im::ReadSide(42, replacement, true, actualBefore));
++  assert(smart_im::ReadSide(42, replacement, false, actualAfter));
++  assert(actualBefore == before && actualAfter == after);
++}
++
++int main() {
++  // Existing text is read at the insertion point without any commit history.
++  auto doc = DocumentWith(L"原有语境。这里继续。");
++  ExpectAround(At(doc, 5, 5), L"原有语境。", L"这里继续。");
++  ExpectAround(At(doc, 0, 0), L"", doc->text);
++  ExpectAround(At(doc, 10, 10), doc->text, L"");
++
++  // Inline selected Chinese + active pinyin all belong to composition and
++  // must be excluded. Lua will add the selected prefix exactly once.
++  doc = DocumentWith(L"原文已经选中pin yin后文");
++  auto composition = At(doc, 2, 13);
++  auto caret = At(doc, 9, 9);
++  assert(smart_im::Covers(42, composition, caret));
++  ExpectAround(composition, L"原文", L"后文");
++  assert(!smart_im::Covers(42, composition, At(doc, 0, 0)));
++  // 0.17.4's non-inline placeholder is not document context either.
++  doc = DocumentWith(L"原文 后文");
++  ExpectAround(At(doc, 2, 3), L"原文", L"后文");
++  // A nonempty selected body range is replaced, so neither side includes it.
++  doc = DocumentWith(L"之前替换这段之后");
++  ExpectAround(At(doc, 2, 6), L"之前", L"之后");
++
++  // Repeated text cannot hide a caret move or a different document.
++  doc = DocumentWith(L"重复重复");
++  assert(!smart_im::SameRange(42, At(doc, 0, 0), At(doc, 2, 2)));
++  assert(!smart_im::SameRange(42, At(doc, 2, 2),
++                              At(DocumentWith(doc->text), 2, 2)));
++
++  doc = DocumentWith(std::wstring(500, L'前') + L"X" + std::wstring(500, L'后'));
++  ExpectAround(At(doc, 500, 501), std::wstring(128, L'前'), std::wstring(128, L'后'));
++  doc->regionStart = 498;
++  doc->regionEnd = 503;
++  ExpectAround(At(doc, 500, 501), L"前前", L"后后");
++
++  // UTF-16 edge clipping never emits half an emoji as invalid UTF-8.
++  doc = DocumentWith(L"\U0001f642" + std::wstring(127, L'前') + L"X" +
++                     std::wstring(127, L'后') + L"\U0001f642");
++  ExpectAround(At(doc, 129, 130), std::wstring(127, L'前'), std::wstring(127, L'后'));
++  std::wstring encoded;
++  assert(smart_im::Utf8Hex(L"\U0001f642中\t\n", encoded));
++  assert(encoded == L"f09f9982e4b8ad090a");
++  assert(!smart_im::Utf8Hex(std::wstring(1, 0xd800), encoded));
++
++  doc = DocumentWith(L"之前之后");
++  auto range = At(doc, 2, 2);
++  doc->failRead = true;
++  assert(!smart_im::ReadSide(42, range, true, encoded));
++  doc->failRead = false;
++  doc->shortRead = true;
++  assert(!smart_im::ReadSide(42, range, true, encoded));
++  std::cout << "TSF COM range tests passed\n";
++}
+diff --git a/include/PipeChannel.h b/include/PipeChannel.h
+index bebc73a..4e775fa 100644
+--- a/include/PipeChannel.h
++++ b/include/PipeChannel.h
+@@ -36,6 +36,7 @@ class PipeChannelBase {
+   HANDLE hpipe;
+ 
+   bool has_body;
++  size_t received_body_size = 0;
+   const size_t buff_size;
+   std::unique_ptr<char[]> buffer;
+   std::unique_ptr<Stream> write_stream;
+@@ -107,6 +108,11 @@ class PipeChannel : public PipeChannelBase {
+ 
+   char* ReceiveBuffer() const { return buffer.get() + _ResSize; }
+ 
++  // _Receive consumes the header into a separate object. The remaining pipe
++  // message starts at byte zero, not after another copy of that header.
++  char* ReceivedBody() const { return buffer.get(); }
++  size_t ReceivedBodySize() const { return received_body_size; }
++
+   template <typename _TyHandler>
+   bool HandleResponseData(_TyHandler const& handler) {
+     if (!handler) {
+diff --git a/include/RimeWithWeasel.h b/include/RimeWithWeasel.h
+index 6fb0a4c..4778ca0 100644
+--- a/include/RimeWithWeasel.h
++++ b/include/RimeWithWeasel.h
+@@ -54,6 +54,7 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   virtual bool ChangePage(bool backward, WeaselSessionId ipc_id, EatLine eat);
+   virtual void FocusIn(DWORD param, WeaselSessionId ipc_id);
+   virtual void FocusOut(DWORD param, WeaselSessionId ipc_id);
++  bool UpdateLocalContext(const std::wstring& packet, WeaselSessionId ipc_id) override;
+   virtual void UpdateInputPosition(RECT const& rc, WeaselSessionId ipc_id);
+   virtual void StartMaintenance();
+   virtual void EndMaintenance();
+diff --git a/include/SmartIMContext.h b/include/SmartIMContext.h
+new file mode 100644
+index 0000000..5a01ada
+--- /dev/null
++++ b/include/SmartIMContext.h
+@@ -0,0 +1,53 @@
++#pragma once
++
++#include <windows.h>
++#include <string>
++
++namespace smart_im {
++
++constexpr size_t kMaxPacket = 1700;
++constexpr size_t kMaxUnits = 128;
++
++inline int HexDigit(wchar_t c) {
++  if (c >= L'0' && c <= L'9') return c - L'0';
++  if (c >= L'a' && c <= L'f') return c - L'a' + 10;
++  if (c >= L'A' && c <= L'F') return c - L'A' + 10;
++  return -1;
++}
++
++inline bool ValidHexText(const std::wstring& hex) {
++  if (hex.size() > kMaxUnits * 6 || hex.size() % 2) return false;
++  if (hex.empty()) return true;
++  std::string bytes;
++  for (size_t i = 0; i < hex.size(); i += 2) {
++    const int high = HexDigit(hex[i]), low = HexDigit(hex[i + 1]);
++    if (high < 0 || low < 0) return false;
++    bytes.push_back(static_cast<char>((high << 4) | low));
++  }
++  const int units = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
++                                       bytes.data(), static_cast<int>(bytes.size()),
++                                       nullptr, 0);
++  return units > 0 && units <= kMaxUnits;
++}
++
++// Empty is an explicit invalidation. All nonempty snapshots are one atomic
++// property, so Lua cannot combine a new token with old text (or vice versa).
++inline bool ValidPacket(const std::wstring& packet) {
++  if (packet.empty()) return true;
++  if (packet.size() > kMaxPacket || packet.compare(0, 2, L"1\t") != 0)
++    return false;
++  const auto token_end = packet.find(L'\t', 2);
++  if (token_end == std::wstring::npos || token_end < 3 || token_end > 66)
++    return false;
++  for (size_t i = 2; i < token_end; ++i) {
++    const wchar_t c = packet[i];
++    if (!((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
++          (c >= L'0' && c <= L'9') || c == L'_' || c == L'-')) return false;
++  }
++  const auto before_end = packet.find(L'\t', token_end + 1);
++  if (before_end == std::wstring::npos) return false;
++  return ValidHexText(packet.substr(token_end + 1, before_end - token_end - 1)) &&
++         ValidHexText(packet.substr(before_end + 1));
++}
++
++}  // namespace smart_im
+diff --git a/include/WeaselIPC.h b/include/WeaselIPC.h
+index 3065cb5..9a621cb 100644
+--- a/include/WeaselIPC.h
++++ b/include/WeaselIPC.h
+@@ -32,6 +32,7 @@ enum WEASEL_IPC_COMMAND {
+   WEASEL_IPC_SELECT_CANDIDATE_ON_CURRENT_PAGE,
+   WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
+   WEASEL_IPC_CHANGE_PAGE,
++  WEASEL_IPC_UPDATE_LOCAL_CONTEXT,
+   WEASEL_IPC_LAST_COMMAND
+ };
+ 
+@@ -76,6 +77,9 @@ struct RequestHandler {
+   }
+   virtual void FocusIn(DWORD param, DWORD session_id) {}
+   virtual void FocusOut(DWORD param, DWORD session_id) {}
++  virtual bool UpdateLocalContext(const std::wstring& packet, DWORD session_id) {
++    return false;
++  }
+   virtual void UpdateInputPosition(RECT const& rc, DWORD session_id) {}
+   virtual void StartMaintenance() {}
+   virtual void EndMaintenance() {}
+@@ -138,6 +142,8 @@ class Client {
+   void FocusIn();
+   // 输入窗口失去焦点
+   void FocusOut();
++  // Atomic, bounded Smart IM TSF snapshot; empty means immediately invalid.
++  bool UpdateLocalContext(const std::wstring& packet);
+   // 托盤菜單
+   void TrayCommand(UINT menuId);
+   // 读取server返回的数据
+diff --git a/test/SmartIMContextTest.cpp b/test/SmartIMContextTest.cpp
+new file mode 100644
+index 0000000..7772069
+--- /dev/null
++++ b/test/SmartIMContextTest.cpp
+@@ -0,0 +1,96 @@
++#include <SmartIMContext.h>
++
++#include <cstdlib>
++#include <iostream>
++#include <string>
++
++namespace {
++
++int checks = 0;
++
++void Check(bool condition, const char* name) {
++  ++checks;
++  if (!condition) {
++    std::cerr << "FAIL: " << name << '\n';
++    std::exit(EXIT_FAILURE);
++  }
++}
++
++std::wstring Repeat(const std::wstring& value, size_t count) {
++  std::wstring result;
++  for (size_t i = 0; i < count; ++i)
++    result += value;
++  return result;
++}
++
++std::wstring Packet(const std::wstring& token,
++                    const std::wstring& before = L"",
++                    const std::wstring& after = L"") {
++  return L"1\t" + token + L"\t" + before + L"\t" + after;
++}
++
++}  // namespace
++
++int main() {
++  using smart_im::ValidHexText;
++  using smart_im::ValidPacket;
++
++  Check(ValidPacket(L""), "empty packet explicitly invalidates the snapshot");
++  Check(ValidPacket(Packet(L"t")), "empty document on both sides");
++  Check(ValidPacket(Packet(L"doc-7_caret-22", L"e5898d", L"e5908e")),
++        "independent Chinese before and after context");
++  Check(ValidPacket(Packet(L"Mixed_CASE-123", L"E5898D", L"F09F9880")),
++        "uppercase hex, token alphabet, and supplementary Unicode");
++  Check(ValidPacket(Packet(L"t", L"e5898d0a09", L"0d0a20")),
++        "encoded tabs and newlines stay inside their text fields");
++  Check(ValidPacket(Packet(std::wstring(64, L'x'))), "maximum token length");
++  Check(ValidPacket(Packet(L"t", L"", L"e5908e")), "after-only context");
++  Check(ValidPacket(Packet(L"t", L"e5898d", L"")), "before-only context");
++
++  const auto full_bmp = Repeat(L"e4b880", 128);
++  const auto full_pairs = Repeat(L"f09f9880", 64);
++  Check(ValidPacket(Packet(std::wstring(64, L't'), full_bmp, full_bmp)),
++        "maximum UTF-16 fields and token fit in one bounded packet");
++  Check(ValidPacket(Packet(L"t", full_pairs, full_pairs)),
++        "surrogate pairs count as two UTF-16 units");
++  Check(ValidHexText(std::wstring()), "empty encoded text");
++  Check(ValidHexText(Repeat(L"61", 128)), "128 ASCII UTF-16 units");
++  Check(ValidHexText(Repeat(L"c2a2", 128)), "128 two-byte UTF-8 units");
++  Check(ValidHexText(full_bmp), "128 three-byte UTF-8 units");
++  Check(ValidHexText(full_pairs), "128 UTF-16 units in supplementary characters");
++  Check(!ValidHexText(Repeat(L"61", 129)), "ASCII context over UTF-16 bound");
++  Check(!ValidHexText(Repeat(L"c2a2", 129)), "two-byte context over UTF-16 bound");
++  Check(!ValidHexText(full_bmp + L"61"), "context over encoded-byte bound");
++  Check(!ValidHexText(full_pairs + L"61"), "supplementary context over UTF-16 bound");
++  Check(!ValidPacket(Packet(L"t", full_bmp + L"61", L"")),
++        "before context bound is enforced independently");
++  Check(!ValidPacket(Packet(L"t", L"", full_bmp + L"61")),
++        "after context bound is enforced independently");
++
++  for (const auto* invalid : {L"0", L"gg", L"61 62", L"ff", L"80", L"c0af",
++                              L"eda080", L"f4908080", L"f09f98", L"efbf"}) {
++    Check(!ValidHexText(invalid), "malformed UTF-8 or hex rejected");
++    Check(!ValidPacket(Packet(L"t", invalid, L"")),
++          "malformed before field rejected");
++    Check(!ValidPacket(Packet(L"t", L"", invalid)),
++          "malformed after field rejected");
++  }
++
++  for (const auto& token : {L"", L"../field", L"field space", L"field\nnext",
++                           L"field\tother", L"field.dot", L"\x4e2d"}) {
++    Check(!ValidPacket(Packet(token)), "unsafe or empty token rejected");
++  }
++  Check(!ValidPacket(Packet(std::wstring(65, L'x'))), "oversized token rejected");
++  Check(!ValidPacket(L"0\tt\t\t"), "unsupported protocol version rejected");
++  Check(!ValidPacket(L"2\tt\t\t"), "future protocol version rejected");
++  Check(!ValidPacket(L"1\tt\t"), "missing after field rejected");
++  Check(!ValidPacket(L"1\tt\t\t\t"), "extra field rejected");
++  Check(!ValidPacket(L"1\tt\t61\t62\n"), "raw newline rejected");
++  Check(!ValidPacket(Packet(L"t") + std::wstring(1, L'\0')),
++        "embedded raw NUL rejected");
++  Check(!ValidPacket(Packet(L"t") + std::wstring(smart_im::kMaxPacket, L'0')),
++        "oversized packet rejected before parsing");
++
++  std::cout << "SmartIMContextTest: " << checks << " checks passed\n";
++  return EXIT_SUCCESS;
++}
+diff --git a/test/SmartIMPipeTest.cpp b/test/SmartIMPipeTest.cpp
+new file mode 100644
+index 0000000..ce4157f
+--- /dev/null
++++ b/test/SmartIMPipeTest.cpp
+@@ -0,0 +1,234 @@
++#include <PipeChannel.h>
++#include <SmartIMContext.h>
++
++#include <cstring>
++#include <functional>
++#include <future>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++
++int checks = 0;
++
++void Check(bool condition, const char* name) {
++  ++checks;
++  if (!condition)
++    throw std::runtime_error(name);
++}
++
++struct Header {
++  DWORD command;
++  DWORD length;
++  DWORD session;
++};
++
++class Receiver : public weasel::PipeChannel<DWORD, Header> {
++ public:
++  explicit Receiver(std::wstring name = L"unused") : PipeChannel(std::move(name)) {}
++
++  HANDLE Accept() { return _ConnectServerPipe(pname); }
++
++  Header Receive(HANDLE pipe) {
++    Header header{};
++    _Receive(pipe, &header, sizeof(header));
++    return header;
++  }
++
++  void Respond(HANDLE pipe, DWORD result) { _Send(pipe, result); }
++};
++
++struct PipePair {
++  HANDLE server = INVALID_HANDLE_VALUE;
++  HANDLE client = INVALID_HANDLE_VALUE;
++  std::wstring name;
++
++  explicit PipePair(int serial, bool raw_client = true) {
++    name = L"\\\\.\\pipe\\smart-im-context-test-" +
++        std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(serial);
++    server = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX,
++        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 65536, 65536,
++        1000, nullptr);
++    Check(server != INVALID_HANDLE_VALUE, "create named pipe");
++    if (!raw_client) return;
++    client = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
++        OPEN_EXISTING, 0, nullptr);
++    Check(client != INVALID_HANDLE_VALUE, "connect named-pipe client");
++    Check(ConnectNamedPipe(server, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED,
++          "accept named-pipe client");
++    DWORD mode = PIPE_READMODE_MESSAGE;
++    Check(SetNamedPipeHandleState(client, &mode, nullptr, nullptr) != FALSE,
++          "client reads complete messages");
++  }
++
++  ~PipePair() {
++    if (client != INVALID_HANDLE_VALUE) CloseHandle(client);
++    if (server != INVALID_HANDLE_VALUE) CloseHandle(server);
++  }
++
++  void Send(Header header, const std::wstring* body = nullptr) {
++    const size_t body_bytes = body ? (body->size() + 1) * sizeof(wchar_t) : 0;
++    std::vector<char> message(sizeof(header) + body_bytes);
++    std::memcpy(message.data(), &header, sizeof(header));
++    if (body)
++      std::memcpy(message.data() + sizeof(header), body->c_str(), body_bytes);
++    DWORD written = 0;
++    Check(WriteFile(client, message.data(), static_cast<DWORD>(message.size()),
++                    &written, nullptr) && written == message.size(),
++          "send framed request");
++  }
++};
++
++std::wstring Body(const Receiver& receiver, const Header& header) {
++  Check(receiver.ReceivedBodySize() == (header.length + 1) * sizeof(wchar_t),
++        "received body byte count excludes header");
++  const auto* body = reinterpret_cast<const wchar_t*>(receiver.ReceivedBody());
++  Check(body[header.length] == L'\0', "received body includes terminator");
++  return std::wstring(body, header.length);
++}
++
++}  // namespace
++
++int main() {
++  try {
++    PipePair first(1), second(2);
++    Receiver first_receiver, second_receiver;
++    const std::wstring first_packet = L"1\tfirst-field\te5898d\te5908e";
++    const std::wstring second_packet = L"1\tsecond-field\t616263\t646566";
++
++    // Both reads are active before dispatch. The second connection must not
++    // overwrite the first connection's pending body (the old shared buffer did).
++    auto first_read = std::async(std::launch::async, [&] {
++      return first_receiver.Receive(first.server);
++    });
++    auto second_read = std::async(std::launch::async, [&] {
++      return second_receiver.Receive(second.server);
++    });
++    first.Send({1, static_cast<DWORD>(first_packet.size()), 101}, &first_packet);
++    second.Send({1, static_cast<DWORD>(second_packet.size()), 202}, &second_packet);
++    const auto first_header = first_read.get(), second_header = second_read.get();
++    Check(first_header.session == 101 && second_header.session == 202,
++          "parallel clients preserve their session headers");
++    Check(Body(first_receiver, first_header) == first_packet,
++          "first packet keeps its leading framing and token after second receive");
++    Check(Body(second_receiver, second_header) == second_packet,
++          "second packet keeps its independent context");
++    Check(smart_im::ValidPacket(Body(first_receiver, first_header)),
++          "real pipe transport delivers a valid complete context packet");
++
++    // Header-only requests must not be able to reuse the previous body.
++    first.Send({1, first_header.length, 101});
++    first_receiver.Receive(first.server);
++    Check(first_receiver.ReceivedBodySize() == 0,
++          "missing body is observable even after a valid preceding request");
++
++    const std::wstring short_body = L"1\tx\t\t";
++    first.Send({1, 1700, 101}, &short_body);
++    const auto truncated = first_receiver.Receive(first.server);
++    Check(first_receiver.ReceivedBodySize() < (truncated.length + 1) * sizeof(wchar_t),
++          "truncated packet cannot masquerade as the declared full body");
++
++    // A malformed header is rejected before any handler sees it.
++    DWORD fragment = 1, written = 0;
++    Check(WriteFile(first.client, &fragment, sizeof(fragment), &written, nullptr) != FALSE,
++          "send truncated header");
++    bool rejected = false;
++    try {
++      first_receiver.Receive(first.server);
++    } catch (DWORD error) {
++      rejected = error == ERROR_INVALID_DATA;
++    }
++    Check(rejected, "truncated header is rejected with a transport error");
++    Check(first_receiver.ReceivedBodySize() == 0, "failed receive leaves no stale body size");
++
++    // Sending a response also has to use the request's own buffer. Run its
++    // writer concurrently because production _Send flushes until the client reads.
++    second_receiver << L"context=second\n" << L'\0';
++    auto response = std::async(std::launch::async, [&] {
++      second_receiver.Respond(second.server, 7);
++    });
++    std::vector<char> reply(65536);
++    DWORD read = 0;
++    Check(ReadFile(second.client, reply.data(), static_cast<DWORD>(reply.size()),
++                   &read, nullptr) != FALSE, "read response from matching connection");
++    response.get();
++    Check(read >= sizeof(DWORD) + 2 && *reinterpret_cast<const DWORD*>(reply.data()) == 7,
++          "response header belongs to matching request");
++    Check(std::wstring(reinterpret_cast<const wchar_t*>(reply.data() + sizeof(DWORD))) ==
++              L"context=second\n",
++          "response body uses the matching connection buffer");
++
++    // A TSF edit callback can publish context after key handling returns but
++    // before GetResponseData consumes its response. The notification must use
++    // an independent client channel so its outgoing body cannot replace that
++    // pending key response.
++    PipePair key_pipe(3, false), context_pipe(4, false);
++    weasel::PipeChannel<Header> key_client(std::wstring(key_pipe.name));
++    weasel::PipeChannel<Header> context_client(std::wstring(context_pipe.name));
++    Check(key_client.Connect() && context_client.Connect(),
++          "independent key and context clients connect");
++    Check(ConnectNamedPipe(key_pipe.server, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED,
++          "accept key client");
++    Check(ConnectNamedPipe(context_pipe.server, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED,
++          "accept context client");
++    Receiver key_server, context_server;
++    auto key_worker = std::async(std::launch::async, [&] {
++      const auto header = key_server.Receive(key_pipe.server);
++      key_server << L"action=ctx\nctx.preedit=original-key-response\n.\n" << L'\0';
++      key_server.Respond(key_pipe.server, 1);
++      return header;
++    });
++    Header key_request{2, 0, 303};
++    Check(key_client.Transact(key_request) == 1, "key operation returns before response consumed");
++    Check(key_worker.get().session == 303, "key request session arrives");
++    auto context_worker = std::async(std::launch::async, [&] {
++      const auto header = context_server.Receive(context_pipe.server);
++      const auto* body = reinterpret_cast<const wchar_t*>(context_server.ReceivedBody());
++      const std::wstring packet(body, header.length);
++      context_server.Respond(context_pipe.server, 1);
++      return packet;
++    });
++    context_client << second_packet.c_str() << L'\0';
++    Header context_request{1, static_cast<DWORD>(second_packet.size()), 303};
++    Check(context_client.Transact(context_request) == 1,
++          "context notification completes between key operation and response read");
++    Check(context_worker.get() == second_packet, "context notification arrives intact");
++    std::wstring pending_key_response;
++    std::function<bool(wchar_t*, UINT)> consume_response = [&](wchar_t* body, UINT) {
++      pending_key_response = body;
++      return true;
++    };
++    Check(key_client.HandleResponseData(consume_response), "read pending key response");
++    Check(pending_key_response == L"action=ctx\nctx.preedit=original-key-response\n.\n",
++          "interleaved context transact preserves unconsumed key response");
++
++    // Exercise the production accept path with a racing first client. This
++    // accepts both a pending ConnectNamedPipe and ERROR_PIPE_CONNECTED.
++    const auto accept_name = L"\\\\.\\pipe\\smart-im-context-accept-" +
++        std::to_wstring(GetCurrentProcessId());
++    Receiver accepting(accept_name);
++    auto accept_worker = std::async(std::launch::async, [&] { return accepting.Accept(); });
++    bool ready = false;
++    for (int attempt = 0; attempt < 1000 && !ready; ++attempt) {
++      ready = WaitNamedPipeW(accept_name.c_str(), 10) != FALSE;
++      if (!ready) Sleep(1);
++    }
++    Check(ready, "production server creates a connectable pipe");
++    weasel::PipeChannel<Header> accepted_client{std::wstring(accept_name)};
++    Check(accepted_client.Connect(), "first client connects to production accept path");
++    HANDLE accepted_pipe = accept_worker.get();
++    Check(accepted_pipe != INVALID_HANDLE_VALUE, "production accept returns connected handle");
++    accepted_client.Disconnect();
++    CloseHandle(accepted_pipe);
++
++    std::cout << "SmartIMPipeTest: " << checks << " checks passed\n";
++    return 0;
++  } catch (const std::exception& error) {
++    std::cerr << "FAIL: " << error.what() << '\n';
++  } catch (DWORD error) {
++    std::cerr << "FAIL: Windows pipe error " << error << '\n';
++  }
++  return 1;
++}

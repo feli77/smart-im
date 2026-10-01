@@ -5,7 +5,7 @@ schema:
   version: "0.4.0"
   description: |
     本地 AI 候选排序。模型返回后自动更新候选并高亮推荐词。
-    需要 luna_pinyin 词典、librime-lua 和独立运行的 Smart IM 服务。
+    需要带 TSF 上下文补丁的小狼毫、luna_pinyin 词典、librime-lua 和 Smart IM 服务。
   dependencies:
     - luna_pinyin
 

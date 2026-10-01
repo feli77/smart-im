@@ -21,7 +21,7 @@ class BatchModel:
         self.best = best
         self.calls = []
 
-    def rerank(self, context, texts, pinyin=""):
+    def rerank(self, context, texts, pinyin="", context_after=""):
         self.calls.append((context, texts, pinyin))
         if self.best is None:
             return list(range(len(texts)))
@@ -65,7 +65,8 @@ def bridge(tmp_path, monkeypatch):
 
 
 def composition_after(bridge, text):
-    bridge.commit(text, pinyin="xitongzhichi")
+    # Text can predate this IME session; a TSF read supplies it independently.
+    bridge.tsf_context(text)
     bridge.context.input = "shishi"
     bridge.context.caret_pos = 6
 
@@ -101,6 +102,7 @@ def test_ollama_response_updates_and_highlights_without_user_keypress(
         assert payload["model"] == "qwen3:1.7b"
         assert json.loads(payload["messages"][1]["content"]) == {
             "context": "系统支持",
+            "context_after": "",
             "pinyin": "shishi",
             "options": [
                 {"index": index, "phrase": "系统支持" + text}
@@ -149,7 +151,7 @@ def test_empty_context_keeps_native_order_without_ollama_request(tmp_path, bridg
         assert not (engine.data_dir / "learning.sqlite3").exists()
 
 
-@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("in_document", [False, True])
 @pytest.mark.parametrize(
     "prefix,spelling,pinyin,texts",
     [
@@ -158,14 +160,14 @@ def test_empty_context_keeps_native_order_without_ollama_request(tmp_path, bridg
     ],
 )
 def test_context_reaches_batch_ranker_and_response_updates_display(
-    tmp_path, bridge, committed, prefix, spelling, pinyin, texts
+    tmp_path, bridge, in_document, prefix, spelling, pinyin, texts
 ):
     model = BatchModel(best=1)
     engine = Engine(tmp_path / "personal", model)
     with mailbox_service(bridge, engine, debounce_interval=0) as service:
         service.poll_once()
-        if committed:
-            bridge.commit(prefix, spelling)
+        if in_document:
+            bridge.tsf_context(prefix)
             bridge.context.input = pinyin
             start = 0
         else:
@@ -203,7 +205,8 @@ def test_commit_learning_requires_both_opt_ins_end_to_end(
         assert engine.stats()["selections"] == int(allowed)
         assert not list(bridge.directory.glob("*.commit"))
 
-        # Navigation clears transient history, leaving only learned word evidence.
+        # A new TSF generation keeps the empty document snapshot independent of learning.
+        bridge.tsf_context(token="next-position")
         bridge.press(0xFF51)
         assert identities(bridge.filter()) == [1, 2, 3]
         service.poll_once()
@@ -340,7 +343,7 @@ def test_rebuilding_candidates_recovers_after_service_expires_idle_files(tmp_pat
 
 def test_real_engine_model_failure_never_highlights_a_recommendation(tmp_path, bridge):
     class BrokenModel(BatchModel):
-        def rerank(self, context, texts, pinyin=""):
+        def rerank(self, context, texts, pinyin="", context_after=""):
             raise RuntimeError("private context must not appear in the fallback response")
 
     engine = Engine(tmp_path / "personal", BrokenModel())
@@ -350,7 +353,94 @@ def test_real_engine_model_failure_never_highlights_a_recommendation(tmp_path, b
         bridge.filter()
         service.poll_once()
         assert engine.stats()["model_error"] == "RuntimeError"
-        assert bridge.response_path.read_text().endswith("fallback\n1,2,3\n")
+        assert bridge.response_path.read_text().endswith("fallback\tfield-1\n1,2,3\n")
         assert identities(bridge.displayed) == [1, 2, 3]
         assert "AI暂不可用" in bridge.context.segment.prompt
         assert "AI 推荐" not in bridge.context.segment.prompt
+
+
+def test_original_document_and_selected_prefix_reach_ollama_exactly_once(
+    tmp_path, bridge, ollama_server
+):
+    engine = Engine(tmp_path / "personal", OllamaReranker(endpoint=ollama_server.endpoint))
+    with mailbox_service(bridge, engine, debounce_interval=0) as service:
+        service.poll_once()
+        bridge.tsf_context("原文：我们", "这项方案。", token="document-7")
+        bridge.context.input, bridge.context.caret_pos = "jihuashishi", 11
+        bridge.set_segments(("计划", 0, 5, "kSelected"))
+        originals = bridge.make_candidates(["事实", "实时", "实施"], start=5, finish=11)
+        bridge.filter(originals)
+        request = parse_rank_request(bridge.request_path.read_bytes())
+        assert request.context == "原文：我们"
+        assert request.selected_prefix == "计划"
+        assert request.context_after == "这项方案。"
+        service.poll_once()
+        _, _, payload = ollama_server.requests[0]
+        sent = json.loads(payload["messages"][1]["content"])
+        assert sent["context"] == "原文：我们计划"
+        assert sent["context_after"] == "这项方案。"
+        assert sent["pinyin"] == "shishi"
+        assert [option["phrase"] for option in sent["options"]] == [
+            f"原文：我们计划{text}这项方案。" for text in ["事实", "实时", "实施"]
+        ]
+        assert identities(bridge.displayed) == [2, 1, 3]
+
+
+@pytest.mark.parametrize("change", ["cursor", "focus"])
+@pytest.mark.parametrize("inflight", [False, True])
+def test_tsf_cursor_and_focus_change_cancel_pending_or_inflight_rank(
+    tmp_path, bridge, monkeypatch, change, inflight
+):
+    model = BatchModel(best=1)
+    engine = Engine(tmp_path / "personal", model)
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    calls = []
+
+    def change_context():
+        if change == "cursor":
+            # The text is identical; the position/focus generation still differs.
+            bridge.tsf_context("系统支持", token="another-position")
+        else:
+            bridge.property("smart_im_context", "")
+
+    def rank(*args, **kwargs):
+        calls.append(kwargs)
+        if inflight:
+            change_context()
+        return [1, 0, 2]
+
+    monkeypatch.setattr(engine, "rerank", rank)
+    with mailbox_service(bridge, engine) as service:
+        service.poll_once()
+        composition_after(bridge, "系统支持")
+        bridge.filter()
+        service.poll_once()
+        assert not calls
+        if not inflight:
+            change_context()
+        clock[0] += 0.1
+        service.poll_once()
+        assert len(calls) == int(inflight)
+        assert not bridge.request_path.exists()
+        assert not bridge.response_path.exists()
+        assert service.refresh.notifications == 0
+        assert identities(bridge.displayed) == [1, 2, 3]
+        assert bridge.context.segment.prompt == ""
+
+
+def test_frontend_without_tsf_never_ranks_or_reconstructs_committed_history(
+    tmp_path, bridge, ollama_server
+):
+    engine = Engine(tmp_path / "personal", OllamaReranker(endpoint=ollama_server.endpoint))
+    with mailbox_service(bridge, engine, debounce_interval=0) as service:
+        service.poll_once()
+        bridge.property("smart_im_context", "")
+        bridge.commit("系统支持", "xitongzhichi")
+        bridge.context.input, bridge.context.caret_pos = "shishi", 6
+        assert identities(bridge.filter()) == [1, 2, 3]
+        service.poll_once()
+        assert not bridge.request_path.exists()
+        assert ollama_server.requests == []
+        assert service.refresh.notifications == 0
+        assert "未获取到局部上下文" in bridge.context.segment.prompt

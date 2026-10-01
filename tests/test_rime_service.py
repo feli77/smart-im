@@ -11,6 +11,7 @@ from smart_im.rime_protocol import (
     MAX_BYTES,
     parse_commit_event,
     parse_rank_request,
+    render_response,
     valid_permutation,
 )
 from smart_im.rime_service import MailboxService
@@ -24,9 +25,18 @@ def message(
     pinyin="shijie",
     context="你好\n",
     texts=("世界", "视界", "世界"),
+    *,
+    context_token=None,
+    context_after="",
+    selected_prefix="",
 ):
-    header = f"SMARTIM1\t{operation}\t{session}\t{sequence}\t{int(learning)}\n"
-    fields = [pinyin, context, *texts]
+    version = "SMARTIM1" if context_token is None else "SMARTIM2"
+    header = f"{version}\t{operation}\t{session}\t{sequence}\t{int(learning)}\n"
+    if context_token is None:
+        fields = [pinyin, context, *texts]
+    else:
+        header += context_token + "\n"
+        fields = [pinyin, context, context_after, selected_prefix, *texts]
     return (header + "".join(text.encode().hex() + "\n" for text in fields)).encode()
 
 
@@ -77,11 +87,88 @@ def test_protocol_round_trip_preserves_unicode_duplicates_and_context():
     assert request.session == "test-session"
     assert request.revision == 1
     assert request.context == "你好\n"
+    assert request.context_token == request.context_after == request.selected_prefix == ""
     assert request.candidates == ("世界", "视界", "世界")
     assert parse_rank_request(message().replace(b"\n", b"\r\n")) == request
     event = parse_commit_event(message("COMMIT", texts=("世界",)))
     assert event.text == "世界"
     assert not event.learning
+
+
+def test_v2_protocol_preserves_separate_contexts_and_binds_response_to_snapshot():
+    data = message(
+        context_token="doc_2-position-8",
+        context="原有正文\n",
+        context_after="\t后面的正文😀",
+        selected_prefix="已经选定",
+    )
+    request = parse_rank_request(data)
+    assert request.context_token == "doc_2-position-8"
+    assert request.context == "原有正文\n"
+    assert request.context_after == "\t后面的正文😀"
+    assert request.selected_prefix == "已经选定"
+    assert request.candidates == ("世界", "视界", "世界")
+    assert parse_rank_request(data.replace(b"\n", b"\r\n")) == request
+    assert render_response(request, [1, 2, 0]) == (
+        b"SMARTIM2\tRESULT\ttest-session\t1\tok\tdoc_2-position-8\n2,3,1\n"
+    )
+    assert render_response(request, [0, 1, 2], fallback=True) == (
+        b"SMARTIM2\tRESULT\ttest-session\t1\tfallback\tdoc_2-position-8\n1,2,3\n"
+    )
+
+
+def test_v2_protocol_accepts_maximum_fields_and_empty_document_contexts():
+    request = parse_rank_request(
+        message(
+            session="s" * 64,
+            sequence=2**53 - 1,
+            pinyin="a" * 96,
+            context_token="t" * 64,
+            context="😀" * 128,
+            context_after="后" * 128,
+            selected_prefix="已" * 128,
+            texts=("字" * 64,) * 9,
+        )
+    )
+    assert len(request.context) == len(request.context_after) == len(request.selected_prefix) == 128
+    assert len(request.candidates) == 9
+    request = parse_rank_request(message(context_token="t", context="", texts=("字",)))
+    assert request.context == request.context_after == request.selected_prefix == ""
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"context_token": ""},
+        {"context_token": "x" * 65},
+        {"context_token": "../escape"},
+        {"context_token": "bad\ttoken"},
+        {"context_token": "bad\ntoken"},
+        {"context": "前" * 129},
+        {"context_after": "后" * 129},
+        {"selected_prefix": "已" * 129},
+        {"texts": ()},
+        {"texts": ("字",) * 10},
+        {"texts": ("",)},
+    ],
+)
+def test_v2_protocol_rejects_unbounded_or_ambiguous_snapshots(fields):
+    with pytest.raises(ValueError):
+        parse_rank_request(message(**({"context_token": "token"} | fields)))
+
+
+@pytest.mark.parametrize("field", [4, 5])
+@pytest.mark.parametrize("invalid", [b"ff", b"1", b"61 62"])
+def test_v2_protocol_rejects_invalid_after_and_selected_encoding(field, invalid):
+    lines = message(context_token="token").split(b"\n")
+    lines[field] = invalid
+    with pytest.raises(ValueError):
+        parse_rank_request(b"\n".join(lines))
+
+
+def test_v2_rank_only_does_not_change_commit_protocol():
+    with pytest.raises(ValueError):
+        parse_commit_event(message("COMMIT", texts=("字",)).replace(b"SMARTIM1", b"SMARTIM2"))
 
 
 @pytest.mark.parametrize(
@@ -128,13 +215,74 @@ def test_worker_ranks_once_and_returns_only_one_based_indices(tmp_path):
         )
         assert engine.ranks[0] == (
             ["世界", "视界", "世界"],
-            {"context": "你好\n", "pinyin": "shijie", "private": True},
+            {"context": "你好\n", "context_after": "", "pinyin": "shijie", "private": True},
         )
         assert abs(int((tmp_path / "heartbeat").read_text()) - time.time()) < 2
     assert engine.closed
     assert not (tmp_path / "heartbeat").exists()
     assert not (tmp_path / "test-session.request").exists()
     assert not (tmp_path / "test-session.response").exists()
+
+
+def test_worker_passes_document_and_selected_text_once_with_separate_after_context(tmp_path):
+    engine = FakeEngine()
+    before = "原有文档" * 32
+    selected = "已经选定"
+    with MailboxService(tmp_path, engine, debounce_interval=0) as service:
+        (tmp_path / "test-session.request").write_bytes(
+            message(
+                context_token="field-7-caret-2",
+                context=before,
+                selected_prefix=selected,
+                context_after="原有后文",
+            )
+        )
+        service.poll_once()
+        assert engine.ranks == [
+            (
+                ["世界", "视界", "世界"],
+                {
+                    "context": (before + selected)[-128:],
+                    "context_after": "原有后文",
+                    "pinyin": "shijie",
+                    "private": True,
+                },
+            )
+        ]
+        assert (tmp_path / "test-session.response").read_bytes() == (
+            b"SMARTIM2\tRESULT\ttest-session\t1\tok\tfield-7-caret-2\n3,1,2\n"
+        )
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_snapshot_changed_or_cancelled_during_inference_cannot_publish_or_refresh(tmp_path, cancel):
+    engine = FakeEngine()
+    refresh = FakeRefresh()
+    with MailboxService(tmp_path, engine, debounce_interval=0, refresh=refresh) as service:
+        path = tmp_path / "test-session.request"
+        path.write_bytes(message(context_token="old-caret"))
+        original = engine.rerank
+
+        def move_caret(*args, **kwargs):
+            if cancel:
+                path.unlink()
+            else:
+                # Same spelling, candidates, and revision: only snapshot changed.
+                path.write_bytes(message(context_token="new-caret"))
+            return original(*args, **kwargs)
+
+        engine.rerank = move_caret
+        service.poll_once()
+        assert not (tmp_path / "test-session.response").exists()
+        assert not refresh.notifications
+        if not cancel:
+            engine.rerank = original
+            service.poll_once()
+            assert (
+                (tmp_path / "test-session.response")
+                .read_bytes()
+                .startswith(b"SMARTIM2\tRESULT\ttest-session\t1\tok\tnew-caret\n")
+            )
 
 
 @pytest.mark.parametrize("service_learns", [True, False])

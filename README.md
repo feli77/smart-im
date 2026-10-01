@@ -6,7 +6,7 @@
 
 ## Windows 使用
 
-需要 Python 3.10+、支持现代 `librime-lua` 的[小狼毫](https://github.com/rime/weasel)，以及已能正常使用的 `luna_pinyin` 词典与 OpenCC 简体转换配置。安装并启动 [Ollama](https://ollama.com/download/windows)，然后在项目目录执行：
+需要 Python 3.10+、应用本仓库 [TSF 补丁](docs/TSF.md)的小狼毫 0.17.4 分支（支持现代 `librime-lua`），以及已能正常使用的 `luna_pinyin` 词典与 OpenCC 简体转换配置。安装并启动 [Ollama](https://ollama.com/download/windows)，然后在项目目录执行：
 
 ```powershell
 ollama pull qwen3:1.7b
@@ -23,7 +23,7 @@ py -3 -m venv .venv
 
 保持 Ollama 和服务终端运行，Ctrl+C 退出 Smart IM 服务。首次下载模型需要网络，推理只调用本机 Ollama。服务不会自动下载模型。
 
-先输入并确认“铁血”，再输入 `zhanshi`，停下输入，观察“战士”的推荐结果。计算期间仍可按当前候选选词。没有上下文且未启用学习时保留原序，也不标记为 AI 推荐；模型判断可能出错。已有真实模型诊断见 [验证记录](docs/VALIDATION.md)。
+在已有“铁血”的正文后放置光标，再输入 `zhanshi`，停下输入，观察“战士”的推荐结果。计算期间仍可按当前候选选词。没有上下文且未启用学习时保留原序，也不标记为 AI 推荐；模型判断可能出错。已有真实模型诊断见 [验证记录](docs/VALIDATION.md)。
 
 升级已有安装时，需要更新 Lua 并在小狼毫中**重新部署**，只重启 Python 不会更新已安装的适配器：
 
@@ -31,14 +31,16 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m smart_im install-rime --force
 ```
 
-此命令先备份本项目旧文件。安装只管理 `smart_im.schema.yaml` 和 `lua/smart_im.lua`，不修改现有方案。模型参数、故障排查及自定义用户目录见 [Rime 使用说明](docs/RIME.md)。
+此命令先备份本项目旧文件。官方原版小狼毫尚无此上下文接口：仅更新 Lua 不足以启用 TSF 上下文，需配套构建前端与服务端，见 [构建和验收](docs/TSF.md)。
+
+安装只管理 `smart_im.schema.yaml` 和 `lua/smart_im.lua`，不修改现有方案。模型参数、故障排查及自定义用户目录见 [Rime 使用说明](docs/RIME.md)。
 
 ## 功能与数据
 
 - 在前 9 项中只重排与首候选拼音范围一致的候选，其他范围固定原位，保留 Rime Candidate 对象和元数据。
 - Lua 与 Python 通过有界的本地文件信箱通信；输入过程不等待模型完成。
 - Windows 服务在结果写入后通知小狼毫刷新，刷新前检查前台窗口、焦点和输入状态；切换应用或继续操作后不唤醒旧窗口。其他前端在下次候选重建时读取已完成结果。
-- 上下文来自当前 Rime 会话的有限上屏文本及候选前已选的分段，不读取应用正文；同一应用内的控件切换仍需真机验证。
+- 上下文由小狼毫 TSF 读取当前位置附近的正文前后文，排除整个组合区或被替换选区；已选分段单独加入。光标、正文或输入框变化会撤销旧请求和推荐。读取不可用时保留 Rime 原候选，不积累上屏历史。
 - 个人学习默认关闭。服务使用 `--learn` 且方案切换为“学习开启”时，才读取和写入个人统计。
 - 专用方案关闭 Rime 用户词典学习，由 SQLite 保存确认词句及最多 8 字的上下文后缀。个人数据和临时信箱均为本地明文。
 - Qwen 选择最佳候选并提升到首位，其余保持原序；启用个人学习后，个人统计还可调整顺序。

@@ -40,17 +40,23 @@ def rank_external(
     word_counts: Mapping[str, int],
     context_counts: Mapping[str, float],
     pinyin: str = "",
+    context_after: str = "",
 ) -> list[int]:
     """Combine a model's candidate order with opt-in personal statistics.
 
-    Without context, Rime's original order supplies the prior and no model is
+    Without either context, Rime's original order supplies the prior and no model is
     called. Duplicate texts remain separate indices. Model errors propagate so the
     caller can discard the entire attempted reranking, including personal boosts.
     """
     scores: list[float] = []
     positions = list(range(len(texts)))
-    if context.strip():
-        order = model.rerank(context, list(texts), pinyin)
+    if context.strip() or context_after.strip():
+        # Keep the original call shape for existing forward-only model adapters.
+        order = (
+            model.rerank(context, list(texts), pinyin, context_after=context_after)
+            if context_after
+            else model.rerank(context, list(texts), pinyin)
+        )
         if (
             not isinstance(order, list)
             or any(type(index) is not int for index in order)

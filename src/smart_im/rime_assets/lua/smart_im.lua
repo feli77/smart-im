@@ -7,6 +7,7 @@ local REQUEST_TIMEOUT = 25
 local PENDING = "AI计算中"
 local UNAVAILABLE = "当前候选无法AI排序，保留原候选"
 local UNNEEDED = "当前候选无需AI排序，保留原候选"
+local NO_CONTEXT = "未获取到局部上下文，保留原候选"
 
 local function hex(value)
   return (value:gsub(".", function(byte) return string.format("%02x", string.byte(byte)) end))
@@ -23,6 +24,24 @@ local function tail(value, limit)
   if not length then return "" end
   local start = length > limit and utf8.offset(value, -limit) or 1
   return value:sub(start)
+end
+
+local function local_context(value)
+  -- One property publishes body text and its TSF focus/selection generation
+  -- atomically. The frontend has already excluded the entire composition (or
+  -- the selection it replaces); neither preedit nor committed history belongs here.
+  if type(value) ~= "string" or #value > 2120 then return nil end
+  local token, before, after = value:match("^1\t([a-zA-Z0-9_-]+)\t([a-fA-F0-9]*)\t([a-fA-F0-9]*)$")
+  if not token or #token > 64 then return nil end
+  local function decode(encoded)
+    if #encoded % 2 ~= 0 or #encoded > MAX_CONTEXT * 8 then return nil end
+    local decoded = encoded:gsub("..", function(byte) return string.char(tonumber(byte, 16)) end)
+    if not bounded(decoded, MAX_CONTEXT) then return nil end
+    return decoded
+  end
+  before, after = decode(before), decode(after)
+  if not before or not after then return nil end
+  return { token = token, before = before, after = after }
 end
 
 local function read_file(path, limit)
@@ -66,44 +85,40 @@ local function invalidate(state)
   state.unavailable = nil
 end
 
-local function reset_history(state)
-  state.history, state.last_commit = "", nil
-  invalidate(state)
-end
-
-local function context_before(state, context, start)
-  if start == 0 then return state.history end
-  local text, position = state.history, 0
+local function selected_prefix(context, start)
+  if start == 0 then return "" end
+  local text, position = "", 0
   -- Selected segments remain inside the composition until the whole phrase is
   -- committed. Read only segments before the candidate range: looking up the
   -- active menu here would recursively invoke this filter.
   for _, segment in ipairs(context.composition:toSegmentation():get_segments()) do
     if segment.start >= start then break end
     if segment.start ~= position or segment._end <= position or segment._end > start
-        or (segment.status ~= "kSelected" and segment.status ~= "kConfirmed") then return "" end
+        or (segment.status ~= "kSelected" and segment.status ~= "kConfirmed") then return nil end
     local candidate = segment:get_selected_candidate()
     if not candidate or candidate.start ~= segment.start or candidate._end ~= segment._end
-        or candidate.text == "" or not bounded(candidate.text, MAX_TEXT) then return "" end
+        or candidate.text == "" or not bounded(candidate.text, MAX_TEXT) then return nil end
     text, position = tail(text .. candidate.text, MAX_CONTEXT), segment._end
   end
-  -- Do not splice committed history across an unknown piece of composition.
-  return position == start and text or ""
+  -- Never invent context across an unknown piece of composition.
+  if position ~= start then return nil end
+  return text
 end
 
 local function synchronize(state, context)
   local ai = context:get_option("smart_im_ai") and not context:get_option("ascii_mode")
   local learning = context:get_option("smart_im_learning")
   local app = context:get_property("client_app") or ""
+  local property = context:get_property("smart_im_context") or ""
   if state.ai ~= ai or state.learning ~= learning then
     invalidate(state)
-    if not ai then state.history, state.last_commit = "", nil end
   end
-  if state.app ~= app then reset_history(state) end
-  if state.last_commit and os.time() - state.last_commit > 30 then reset_history(state) end
+  if state.app ~= app or state.context_property ~= property then invalidate(state) end
   state.ai, state.learning, state.app = ai, learning, app
+  state.context_property, state.local_context = property, local_context(property)
   local snapshot = state.snapshot
   if snapshot and (snapshot.input ~= context.input or snapshot.caret ~= context.caret_pos
-      or snapshot.context ~= context_before(state, context, snapshot.start)) then invalidate(state) end
+      or snapshot.selected_prefix ~= selected_prefix(context, snapshot.start)) then invalidate(state) end
 end
 
 local function prompt(context, message)
@@ -115,21 +130,21 @@ local function committed(state, context)
   if not state.ai then return end
   local text = context:get_commit_text()
   if not text or text == "" or not bounded(text, MAX_TEXT) then
-    reset_history(state)
+    invalidate(state)
     return
   end
   local pinyin = context.input or ""
   -- Only confirmed commits learn; refreshing and highlighting never learn.
-  if state.learning and bounded(pinyin, MAX_INPUT) and online(state) then
+  local preceding = state.snapshot and state.snapshot.before
+    or (state.local_context and state.local_context.before)
+  if state.learning and preceding and bounded(pinyin, MAX_INPUT) and online(state) then
     state.sequence = state.sequence + 1
     local data = table.concat({
       "SMARTIM1\tCOMMIT\t" .. state.id .. "\t" .. state.sequence .. "\t1",
-      hex(pinyin), hex(state.history), hex(text), ""
+      hex(pinyin), hex(preceding), hex(text), ""
     }, "\n")
     atomic_write(state.directory .. "/" .. state.id .. "." .. state.sequence .. ".commit", data)
   end
-  state.history = tail(state.history .. text, MAX_CONTEXT)
-  state.last_commit = os.time()
   invalidate(state)
 end
 
@@ -144,7 +159,7 @@ local function init(env)
       .. tostring({})):gsub("[^%w_-]", ""):sub(1, 64)
     state = {
       id = id, directory = rime_api.get_user_data_dir() .. "/smart_im_runtime",
-      revision = 0, sequence = 0, history = "", references = 0, connections = {},
+      revision = 0, sequence = 0, references = 0, connections = {},
     }
     sessions[id] = state
     context:set_property("smart_im_session", id)
@@ -168,9 +183,24 @@ local function init(env)
         ctx:refresh_non_confirmed_composition()
       end
     end)
+    state.connections[#state.connections + 1] = context.property_update_notifier:connect(function(ctx, name)
+      if name ~= "smart_im_context" and name ~= "client_app" then return end
+      local property, app = ctx:get_property("smart_im_context") or "", ctx:get_property("client_app") or ""
+      if property == state.context_property and app == state.app then return end
+      synchronize(state, ctx)
+      prompt(ctx, "")
+      if not state.restoring and not ctx.composition:empty() then
+        -- Remove a displayed recommendation immediately on a TSF change,
+        -- including focus loss with no subsequent key. A refresh must not
+        -- recursively request/apply a result while restoring the native menu.
+        state.restoring = true
+        ctx:refresh_non_confirmed_composition()
+        state.restoring = false
+      end
+    end)
     state.connections[#state.connections + 1] = context.unhandled_key_notifier:connect(function(_, key)
       if not key:release() and (key.keycode ~= 0xff09 or key:ctrl() or key:alt() or key:super()) then
-        reset_history(state)
+        invalidate(state)
       end
     end)
   end
@@ -192,14 +222,18 @@ local function fini(env)
 end
 
 local function snapshot_of(state, context, candidates)
+  local body = state.local_context
+  if not body then return nil, nil, NO_CONTEXT end
   if #candidates == 0 or not bounded(context.input, MAX_INPUT) then return nil, nil, UNAVAILABLE end
   local first = candidates[1]
   local start, finish = first.start, first._end
   if type(start) ~= "number" or type(finish) ~= "number" or start < 0
       or finish <= start or finish > #context.input then return nil, nil, UNAVAILABLE end
   local pinyin = context.input:sub(start + 1, finish)
-  local preceding = context_before(state, context, start)
-  local parts = { hex(context.input), tostring(context.caret_pos), hex(preceding),
+  local selected = selected_prefix(context, start)
+  if selected == nil then return nil, nil, UNAVAILABLE end
+  local parts = { hex(context.input), tostring(context.caret_pos), body.token,
+    hex(body.before), hex(body.after), hex(selected),
     state.learning and "1" or "0" }
   local eligible, slots = {}, {}
   for index, candidate in ipairs(candidates) do
@@ -220,15 +254,16 @@ local function snapshot_of(state, context, candidates)
   end
   if #eligible < 2 then return nil, nil, UNNEEDED end
   return { fingerprint = table.concat(parts, "|"), input = context.input,
-    caret = context.caret_pos, start = start, pinyin = pinyin, context = preceding,
+    caret = context.caret_pos, start = start, pinyin = pinyin, token = body.token,
+    before = body.before, after = body.after, selected_prefix = selected,
     count = #eligible, slots = slots }, eligible
 end
 
 local function request(state, snapshot, candidates)
   if state.sent == state.revision then return end
   local lines = {
-    "SMARTIM1\tRANK\t" .. state.id .. "\t" .. state.revision .. "\t" .. (state.learning and "1" or "0"),
-    hex(snapshot.pinyin), hex(snapshot.context),
+    "SMARTIM2\tRANK\t" .. state.id .. "\t" .. state.revision .. "\t" .. (state.learning and "1" or "0"),
+    snapshot.token, hex(snapshot.pinyin), hex(snapshot.before), hex(snapshot.after), hex(snapshot.selected_prefix),
   }
   for _, candidate in ipairs(candidates) do lines[#lines + 1] = hex(candidate.text) end
   lines[#lines + 1] = ""
@@ -242,9 +277,9 @@ end
 local function ready_order(state)
   local data = read_file(state.directory .. "/" .. state.id .. ".response", 1024)
   if not data or not state.snapshot then return nil end
-  local id, revision, status, indices = data:gsub("\r\n", "\n"):match(
-    "^SMARTIM1\tRESULT\t([%w_-]+)\t(%d+)\t([a-z]+)\n([%d,]+)\n$")
-  if id ~= state.id or tonumber(revision) ~= state.revision then return nil end
+  local id, revision, status, token, indices = data:gsub("\r\n", "\n"):match(
+    "^SMARTIM2\tRESULT\t([%w_-]+)\t(%d+)\t([a-z]+)\t([a-zA-Z0-9_-]+)\n([%d,]+)\n$")
+  if id ~= state.id or tonumber(revision) ~= state.revision or token ~= state.snapshot.token then return nil end
   if status == "fallback" then return nil, "fallback" end
   if status ~= "ok" then return nil end
   local order, used, canonical = {}, {}, {}
@@ -270,7 +305,8 @@ local function request_prompt(state)
 end
 
 local function result_prompt(state, order)
-  if state.snapshot.context == "" and not state.learning then
+  if state.snapshot.before == "" and state.snapshot.after == ""
+      and state.snapshot.selected_prefix == "" and not state.learning then
     local unchanged = true
     for index, value in ipairs(order) do
       if index ~= value then unchanged = false; break end
@@ -283,6 +319,11 @@ end
 local function filter(input, env)
   local state, context = env.smart_im_state, env.engine.context
   synchronize(state, context)
+  if state.restoring then
+    prompt(context, "")
+    for candidate in input:iter() do yield(candidate) end
+    return
+  end
   if not state.ai or not online(state) then
     if state.snapshot then invalidate(state) end
     prompt(context, state.ai and "AI服务未运行，保留原候选" or "")
@@ -371,7 +412,7 @@ local function processor(key, env)
   if key:release() then return 2 end
   local shortcut = key:ctrl() or key:alt() or key:super()
   if shortcut or navigation[key.keycode] or (key.keycode == 0xff08 and context.input == "") then
-    reset_history(state)
+    invalidate(state)
     return 2
   end
   return 2

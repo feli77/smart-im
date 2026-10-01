@@ -1,0 +1,2 @@
+# Preserve upstream CRLF in the generated git-am patch and its context lines.
+patches/weasel/*.patch -text -whitespace

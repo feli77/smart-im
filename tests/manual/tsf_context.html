@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Smart IM TSF 局部上下文验收</title>
+<style>
+  body { max-width: 780px; margin: 40px auto; padding: 0 20px; font: 18px/1.6 system-ui; }
+  textarea, [contenteditable] { box-sizing: border-box; width: 100%; min-height: 110px;
+    padding: 12px; border: 1px solid #888; font: inherit; }
+  label { display: block; margin: 24px 0 8px; }
+  button { margin-top: 12px; padding: 8px 12px; font: inherit; }
+</style>
+<h1>Smart IM TSF 局部上下文验收</h1>
+<p>这些文字在页面加载前已经存在。把光标放在“计划”后，输入拼音；前文应为“我们计划”，后文应为“明天发布”。切换输入框或移动光标后，旧推荐必须消失。</p>
+<label for="first">输入框一：已有正文</label>
+<textarea id="first">我们计划明天发布。
+重复的位置。重复的位置。
+🙂边界字符也应保持完整。</textarea>
+<label for="second">输入框二：同一页面的不同语境</label>
+<textarea id="second">系统支持更新，已经解决问题。</textarea>
+<label for="rich">可编辑正文：测试组合、选择并替换文字</label>
+<div id="rich" contenteditable="true">请在原有语境中继续输入。选中这段文字后输入时，被替换的文字不应进入正文前后文。</div>
+<button id="schedule" type="button">3 秒后修改输入框一的正文</button>
+<p id="status" aria-live="polite">点击按钮后把焦点放回输入框一，可测试有焦点时的程序编辑通知。</p>
+<script>
+  document.querySelector('#schedule').addEventListener('click', () => {
+    document.querySelector('#status').textContent = '等待 3 秒；请把焦点放回输入框一并开始输入。';
+    setTimeout(() => {
+      const field = document.querySelector('#first');
+      field.setRangeText('应用已修改：', 0, 0, 'preserve');
+      document.querySelector('#status').textContent = '已修改正文；旧上下文和旧推荐应失效。';
+    }, 3000);
+  });
+</script>
+</html>

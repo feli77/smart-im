@@ -51,13 +51,15 @@ class Engine:
         context: str = "",
         pinyin: str = "",
         private: bool = False,
+        context_after: str = "",
     ) -> list[int]:
         """Return only indices into an external engine's original candidate pool.
 
         At most 32 candidates of 1–64 characters and 96 raw pinyin characters
         are accepted; invalid inputs raise ValueError. Context uses its last 128
-        characters. Duplicate texts remain separate indices. This method neither
-        decodes pinyin nor generates candidates, and never records a selection.
+        characters before and first 128 after the insertion point. Duplicate texts
+        remain separate indices. This method neither decodes pinyin nor generates
+        candidates, and never records a selection.
         Model failures restore the whole original order, without partial boosts.
         """
         if (
@@ -65,6 +67,7 @@ class Engine:
             or len(texts) > 32
             or any(not isinstance(text, str) or not 1 <= len(text) <= 64 for text in texts)
             or not isinstance(context, str)
+            or not isinstance(context_after, str)
             or not isinstance(pinyin, str)
             or len(pinyin) > 96
         ):
@@ -75,6 +78,7 @@ class Engine:
             if len(texts) < 2:
                 return original
             context = context[-128:]
+            context_after = context_after[:128]
             word_counts: dict[str, int] = {}
             context_counts: dict[str, float] = {}
             if self.learning and not private:
@@ -86,7 +90,7 @@ class Engine:
                     context_counts = store.context_counts(context)
             try:
                 result = rank_external(
-                    texts, context, self.model, word_counts, context_counts, pinyin
+                    texts, context, self.model, word_counts, context_counts, pinyin, context_after
                 )
             except Exception as exc:
                 self._model_error = type(exc).__name__

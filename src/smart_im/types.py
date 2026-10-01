@@ -8,4 +8,6 @@ class CandidateReranker(Protocol):
 
     name: str
 
-    def rerank(self, context: str, texts: list[str], pinyin: str = "") -> list[int]: ...
+    def rerank(
+        self, context: str, texts: list[str], pinyin: str = "", context_after: str = ""
+    ) -> list[int]: ...
