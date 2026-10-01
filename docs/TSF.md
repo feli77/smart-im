@@ -24,6 +24,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_weasel_tsf.p
 
 脚本先完整备份本次涉及的文件和注册信息，再退出服务，覆盖三个原生文件，通过现有官方 `WeaselSetup.exe /s` 复制、注册两个系统 DLL，最后核对哈希和注册路径。它要求现有 `Hant=0`，会重新启用简体输入 profile；不部署词库，不从管理员会话启动服务。记下输出的备份路径。
 
+如果旧版脚本一直停在 `Installing:`，先按 Ctrl+C，并关闭旧安装终端，再从新的管理员终端运行上面的命令，使用新的备份目录。旧版对 `WeaselServer.exe /q` 使用无限等待，原版小狼毫的同步 IPC 可能令该退出进程一直不返回。修复后的脚本显示四个阶段：退出请求最多等待 10 秒，再给服务 10 秒完成保存；残留进程只有在路径、Windows 会话核对后才停止，确认全部退出后才复制。注册步骤最多等待 60 秒，超时报告具体阶段并保留备份。不要让旧、新安装脚本同时运行。
+
 安装完成后关闭管理员终端，在**普通 PowerShell** 中执行：
 
 ```powershell

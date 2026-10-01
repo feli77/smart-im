@@ -83,6 +83,99 @@ function Check-PackageBinary {
     if (-not $marked) { throw "Required Smart IM native feature marker is missing: $Name" }
 }
 
+function Invoke-InstallerProcess {
+    param([string]$FilePath, [string[]]$ArgumentList,
+          [int]$TimeoutSeconds, [string]$Stage)
+    if ($TimeoutSeconds -le 0 -or $TimeoutSeconds -gt 300) {
+        throw "Invalid process timeout for $Stage."
+    }
+    $process = $null
+    $terminator = $null
+    try {
+        # Start-Process -Wait waits without a deadline, including when /q gets
+        # stuck in the old server's synchronous named-pipe shutdown protocol.
+        $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList `
+            -WindowStyle Hidden -PassThru
+        $null = $process.Handle
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            # Also cover regsvr32 children started by WeaselSetup. Only target
+            # this invocation's still-running process and its descendants.
+            if (-not $process.HasExited) {
+                $terminator = Start-Process -FilePath (Join-Path $env:WINDIR "System32\taskkill.exe") `
+                    -ArgumentList @("/PID", [string]$process.Id, "/T", "/F") -WindowStyle Hidden -PassThru
+                $null = $terminator.Handle
+                if (-not $terminator.WaitForExit(5000)) {
+                    $terminator.Kill()
+                    throw "$Stage timed out; process-tree cleanup for PID $($process.Id) could not be confirmed."
+                }
+                if ($terminator.ExitCode -ne 0) {
+                    throw "$Stage timed out; process-tree cleanup for PID $($process.Id) returned $($terminator.ExitCode)."
+                }
+                if (-not $process.WaitForExit(5000)) {
+                    throw "$Stage timed out and process $($process.Id) could not be stopped."
+                }
+            }
+            throw "$Stage timed out after $TimeoutSeconds seconds; its process tree was stopped."
+        }
+        return $process.ExitCode
+    } finally {
+        if ($terminator) { $terminator.Dispose() }
+        if ($process) { $process.Dispose() }
+    }
+}
+
+function Get-InstalledServerProcess {
+    param([string]$ServerPath)
+    $sessionId = (Get-Process -Id $PID).SessionId
+    foreach ($process in @(Get-Process -Name WeaselServer -ErrorAction SilentlyContinue)) {
+        if ($process.SessionId -ne $sessionId) {
+            throw "WeaselServer is active in another Windows session; sign out that session before replacing shared binaries."
+        }
+        if (-not $process.Path -or $process.Path -ne $ServerPath) {
+            throw "A different or unreadable WeaselServer instance is active; inspect doctor_tsf.ps1 first."
+        }
+        $process
+    }
+}
+
+function Stop-InstalledServer {
+    param([string]$ServerPath)
+    if (@(Get-InstalledServerProcess $ServerPath).Count -eq 0) {
+        Write-Output "[1/4] No running WeaselServer; skipping /q."
+        return
+    }
+    Write-Output "[1/4] Requesting WeaselServer shutdown (maximum 10 seconds)..."
+    try {
+        $quitCode = Invoke-InstallerProcess -FilePath $ServerPath -ArgumentList @("/q") `
+            -TimeoutSeconds 10 -Stage "WeaselServer /q"
+        if ($quitCode -ne 0) { Write-Warning "WeaselServer /q returned $quitCode." }
+    } catch {
+        Write-Warning $_.Exception.Message
+    }
+    # The shutdown reply precedes the server's dictionary finalization. Give
+    # it a separate, bounded grace period before considering a forced stop.
+    Write-Output "[1/4] Waiting up to 10 seconds for server finalization..."
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        if (@(Get-InstalledServerProcess $ServerPath).Count -eq 0) { return }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    # A previous interrupted installation can leave its /q helper alive even
+    # after the real server has exited. Revalidate path and session before
+    # stopping each remaining process; never kill by image name alone.
+    foreach ($process in @(Get-InstalledServerProcess $ServerPath)) {
+        if ($process.HasExited) { continue }
+        Write-Warning "Stopping remaining WeaselServer PID $($process.Id) before replacing files."
+        Stop-Process -InputObject $process -Force
+        if (-not $process.WaitForExit(5000)) {
+            throw "WeaselServer PID $($process.Id) did not exit. No binary was replaced."
+        }
+    }
+    if (@(Get-InstalledServerProcess $ServerPath).Count -gt 0) {
+        throw "WeaselServer restarted during installation. No binary was replaced."
+    }
+}
+
 function Read-WerValues {
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey("LocalMachine", "Registry64")
     $key = $base.OpenSubKey($werKey, $false)
@@ -155,11 +248,7 @@ foreach ($architecture in @("x64", "x86")) {
 $BackupDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BackupDir)
 $backupManifest = Join-Path $BackupDir "backup.json"
 $server = Join-Path $installRoot "WeaselServer.exe"
-foreach ($process in @(Get-Process -Name WeaselServer -ErrorAction SilentlyContinue)) {
-    if (-not $process.Path -or $process.Path -ne $server) {
-        throw "A different or unreadable WeaselServer instance is active; inspect doctor_tsf.ps1 first."
-    }
-}
+$null = @(Get-InstalledServerProcess $server)
 
 if ($Rollback) {
     $saved = Get-Content -LiteralPath $backupManifest -Raw | ConvertFrom-Json
@@ -269,24 +358,22 @@ foreach ($item in $saved.wer_values) {
 Write-Output ("Backup ready: {0}" -f $BackupDir)
 Write-Output ("{0}: {1}" -f $(if ($Rollback) { "Rolling back" } else { "Installing" }), $installRoot)
 try {
-    Start-Process -FilePath $server -ArgumentList "/q" -WindowStyle Hidden -Wait
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
-    do {
-        $running = @(Get-Process -Name WeaselServer -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -eq $server })
-        if ($running.Count -eq 0) { break }
-        Start-Sleep -Milliseconds 200
-    } while ([DateTime]::UtcNow -lt $deadline)
-    if ($running.Count -gt 0) { throw "WeaselServer did not exit. No binary was replaced." }
+    Stop-InstalledServer $server
+    Write-Output "[2/4] Copying the three native binaries..."
     foreach ($name in $names) {
         Check-Hash (Join-Path $sourceDir $name) $targetHashes.$name
         Copy-Item -LiteralPath (Join-Path $sourceDir $name) -Destination (Join-Path $installRoot $name) -Force
     }
-    $setupProcess = Start-Process -FilePath $setup -ArgumentList "/s" -WindowStyle Hidden -Wait -PassThru
-    # Setup writes WER defaults unrelated to this change; preserve the previous
-    # four values, without importing whole registry trees or touching other IMEs.
-    Restore-WerValues $saved.wer_values
-    if ($setupProcess.ExitCode -ne 0) { throw "WeaselSetup failed with exit code $($setupProcess.ExitCode)." }
+    Write-Output "[3/4] Registering both TSF DLLs (maximum 60 seconds)..."
+    try {
+        $setupCode = Invoke-InstallerProcess -FilePath $setup -ArgumentList @("/s") `
+            -TimeoutSeconds 60 -Stage "WeaselSetup /s"
+    } finally {
+        # Preserve unrelated WER values even when setup fails or times out.
+        Restore-WerValues $saved.wer_values
+    }
+    if ($setupCode -ne 0) { throw "WeaselSetup failed with exit code $setupCode." }
+    Write-Output "[4/4] Verifying installed files and both TSF registrations..."
     foreach ($name in $names) { Check-Hash (Join-Path $installRoot $name) $targetHashes.$name }
     foreach ($name in $systemDlls.Keys) { Check-Hash $systemDlls[$name] $targetHashes.$name }
     foreach ($architecture in @("x64", "x86")) {
